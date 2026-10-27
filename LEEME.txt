@@ -1,0 +1,35 @@
+TONGA SAMPLER 2 - como compilarlo (sin saber programar)
+=========================================================
+
+1) Entra a github.com, create una cuenta (si no tenes) y toca "New repository".
+   Ponele de nombre: tonga-sampler-2   (publico o privado, da igual).
+
+2) En el repositorio nuevo toca "uploading an existing file" y ARRASTRA el CONTENIDO
+   de esta carpeta (CMakeLists.txt, Source, Assets y la carpeta .github).
+   Despues toca "Commit changes".
+
+   OJO: la carpeta ".github" empieza con punto y a veces no se sube. Si en tu
+   repositorio no aparece, hace esto:
+     - "Add file" > "Create new file"
+     - en el nombre escribi:  .github/workflows/build.yml
+     - pega adentro el contenido del archivo build.yml que viene en el ZIP
+     - "Commit changes"
+
+3) Anda a la pestana "Actions". Va a empezar solo una tarea "Compilar Tonga Sampler 2".
+   Tarda entre 5 y 10 minutos (la primera vez baja JUCE).
+
+4) Cuando termine con tilde verde, entra a esa tarea y abajo, en "Artifacts",
+   baja "Tonga-Sampler-2-VST3".
+
+5) Descomprimilo y copia la carpeta "Tonga Sampler 2.vst3" entera a:
+   C:\Program Files\Common Files\VST3
+   Despues, en FL Studio: Options > Manage plugins > Find installed plugins.
+
+Si la tarea sale con una X roja: entra, copia el texto del error (o sacale captura)
+y pasamelo, asi lo arreglo y te devuelvo los archivos completos para reemplazar.
+
+NOTAS
+- Notas MIDI 36 a 51 tocan los pads 1 a 16 (como una MPC).
+- Hace falta un audio de hasta 15 minutos (wav, mp3, aif, flac, ogg).
+- JUCE es de uso libre para proyectos de codigo abierto (GPL) o con licencia comercial.
+  Para uso personal no hay problema.
