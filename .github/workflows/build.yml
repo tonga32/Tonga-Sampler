@@ -1,0 +1,23 @@
+name: Compilar Tonga Sampler 2
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
+
+      - name: Subir el VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tonga-Sampler-2-VST3
+          path: build/TongaSampler2_artefacts/Release/VST3/
