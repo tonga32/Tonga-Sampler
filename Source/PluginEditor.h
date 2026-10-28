@@ -9,13 +9,20 @@ namespace TongaColours
 {
     inline const juce::Colour yellow { 0xffffd200 };
     inline const juce::Colour pink   { 0xfff98aa0 };
-    inline const juce::Colour bgDark { 0xff121217 };
-    inline const juce::Colour panel  { 0xff1b1b22 };
-    inline const juce::Colour button { 0xff25252d };
+    inline const juce::Colour bgDark { 0xff17171c };
+    inline const juce::Colour panel  { 0xff1f1f26 };
+    inline const juce::Colour button { 0xff2a2a33 };
+    inline const juce::Colour inset  { 0xff0b0b0f };
+
+    // Cada pad tiene un color de la marca (del amarillo al rosa)
+    inline juce::Colour padColour (int i)
+    {
+        return yellow.interpolatedWith (pink, (float) i / (float) (TongaProcessor::numPads - 1));
+    }
 }
 
 //==============================================================================
-// Estilo minimalista: botones planos, faders finos, todo en amarillo / gris
+// Estilo minimalista de Tonga: planos, perillas finas, amarillo y rosa
 class TongaLook : public juce::LookAndFeel_V4
 {
 public:
@@ -33,7 +40,7 @@ public:
         setColour (juce::ComboBox::backgroundColourId, button);
         setColour (juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
         setColour (juce::ComboBox::textColourId, juce::Colours::white);
-        setColour (juce::ComboBox::arrowColourId, juce::Colours::grey);
+        setColour (juce::ComboBox::arrowColourId, yellow);
         setColour (juce::PopupMenu::backgroundColourId, panel);
         setColour (juce::PopupMenu::textColourId, juce::Colours::white);
         setColour (juce::PopupMenu::highlightedBackgroundColourId, yellow);
@@ -49,46 +56,54 @@ public:
         if (over) c = c.brighter (0.12f);
         if (down) c = c.brighter (0.25f);
         g.setColour (c);
-        g.fillRoundedRectangle (area, 6.0f);
+        g.fillRoundedRectangle (area, 5.0f);
     }
 
-    void drawLinearSlider (juce::Graphics& g, int x, int y, int width, int height,
-                           float sliderPos, float, float,
-                           const juce::Slider::SliderStyle style, juce::Slider& s) override
+    // Perilla: arco gris de fondo, arco amarillo del valor y una rayita indicadora
+    void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height, float pos,
+                           float startAngle, float endAngle, juce::Slider& s) override
     {
-        const bool vertical = (style == juce::Slider::LinearVertical);
-        const double base = (s.getMinimum() < 0.0 && s.getMaximum() > 0.0) ? 0.0 : s.getMinimum();
-        const float basePos = (float) s.getPositionOfValue (base);
-        const juce::Colour track (0xff2a2a33);
+        auto bounds = juce::Rectangle<int> (x, y, width, height).toFloat().reduced (6.0f);
+        const float radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
+        const float cx = bounds.getCentreX();
+        const float cy = bounds.getCentreY();
+        const float angle = startAngle + pos * (endAngle - startAngle);
         const juce::Colour accent = s.isEnabled() ? TongaColours::yellow : juce::Colour (0xff6b6b3a);
 
-        if (vertical)
+        g.setColour (TongaColours::inset);
+        g.fillEllipse (cx - radius * 0.78f, cy - radius * 0.78f, radius * 1.56f, radius * 1.56f);
+
+        juce::Path track;
+        track.addCentredArc (cx, cy, radius, radius, 0.0f, startAngle, endAngle, true);
+        g.setColour (juce::Colour (0xff3a3a46));
+        g.strokePath (track, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        const double base = (s.getMinimum() < 0.0 && s.getMaximum() > 0.0) ? 0.0 : s.getMinimum();
+        const float baseAngle = startAngle + (float) s.valueToProportionOfLength (base) * (endAngle - startAngle);
+        if (std::abs (angle - baseAngle) > 0.001f)
         {
-            const float cx = (float) x + (float) width * 0.5f;
-            g.setColour (track);
-            g.fillRoundedRectangle (cx - 2.0f, (float) y, 4.0f, (float) height, 2.0f);
-            g.setColour (accent.withAlpha (0.8f));
-            g.fillRoundedRectangle (cx - 2.0f, juce::jmin (sliderPos, basePos), 4.0f,
-                                    std::abs (basePos - sliderPos), 2.0f);
+            juce::Path val;
+            val.addCentredArc (cx, cy, radius, radius, 0.0f,
+                               juce::jmin (angle, baseAngle), juce::jmax (angle, baseAngle), true);
             g.setColour (accent);
-            g.fillRoundedRectangle (cx - 10.0f, sliderPos - 3.0f, 20.0f, 6.0f, 3.0f);
+            g.strokePath (val, juce::PathStrokeType (3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
-        else
-        {
-            const float cy = (float) y + (float) height * 0.5f;
-            g.setColour (track);
-            g.fillRoundedRectangle ((float) x, cy - 2.0f, (float) width, 4.0f, 2.0f);
-            g.setColour (accent.withAlpha (0.8f));
-            g.fillRoundedRectangle (juce::jmin (sliderPos, basePos), cy - 2.0f,
-                                    std::abs (basePos - sliderPos), 4.0f, 2.0f);
-            g.setColour (accent);
-            g.fillRoundedRectangle (sliderPos - 3.0f, cy - 10.0f, 6.0f, 20.0f, 3.0f);
-        }
+
+        juce::Path pointer;
+        pointer.addRoundedRectangle (-1.5f, -radius * 0.72f, 3.0f, radius * 0.42f, 1.5f);
+        g.setColour (accent);
+        g.fillPath (pointer, juce::AffineTransform::rotation (angle).translated (cx, cy));
+    }
+
+    // Flechitas chicas para los controles tipo +/- (como en Serato)
+    juce::Button* createSliderButton (juce::Slider&, bool isIncrement) override
+    {
+        return new juce::ArrowButton (isIncrement ? "up" : "down", isIncrement ? 0.75f : 0.25f, TongaColours::pink);
     }
 };
 
 //==============================================================================
-// Boton de play / pausa dibujado a mano
+// Boton de play / pausa (caja oscura con triangulo, como Serato)
 class PlayButton : public juce::Button
 {
 public:
@@ -97,28 +112,95 @@ public:
 
     void paintButton (juce::Graphics& g, bool over, bool) override
     {
-        auto b = getLocalBounds().toFloat().reduced (2.0f);
-        g.setColour (over ? juce::Colour (0xff34343f) : TongaColours::button);
-        g.fillEllipse (b);
+        auto b = getLocalBounds().toFloat().reduced (1.0f);
+        g.setColour (over ? juce::Colour (0xff15151b) : TongaColours::inset);
+        g.fillRoundedRectangle (b, 6.0f);
         g.setColour (TongaColours::yellow);
         const auto c = b.getCentre();
         if (playing)
         {
-            g.fillRect (c.x - 6.0f, c.y - 7.0f, 4.0f, 14.0f);
-            g.fillRect (c.x + 2.0f, c.y - 7.0f, 4.0f, 14.0f);
+            g.fillRect (c.x - 7.0f, c.y - 8.0f, 5.0f, 16.0f);
+            g.fillRect (c.x + 2.0f, c.y - 8.0f, 5.0f, 16.0f);
         }
         else
         {
             juce::Path p;
-            p.addTriangle (c.x - 5.0f, c.y - 8.0f, c.x - 5.0f, c.y + 8.0f, c.x + 8.0f, c.y);
+            p.addTriangle (c.x - 6.0f, c.y - 9.0f, c.x - 6.0f, c.y + 9.0f, c.x + 9.0f, c.y);
             g.fillPath (p);
+        }
+    }
+};
+
+// Boton "Reversa" con triangulo hacia la izquierda
+class ReverseButton : public juce::Button
+{
+public:
+    ReverseButton() : juce::Button ("reverse") { setClickingTogglesState (true); }
+
+    void paintButton (juce::Graphics& g, bool over, bool) override
+    {
+        auto b = getLocalBounds().toFloat();
+        const bool on = getToggleState();
+        const juce::Colour c = on ? TongaColours::yellow
+                                  : (over ? juce::Colours::white : juce::Colour (0xff8a8a96));
+        const auto centre = juce::Point<float> (b.getCentreX(), b.getCentreY() - 8.0f);
+        juce::Path p;
+        p.addTriangle (centre.x + 10.0f, centre.y - 12.0f, centre.x + 10.0f, centre.y + 12.0f,
+                       centre.x - 12.0f, centre.y);
+        g.setColour (c);
+        g.fillPath (p);
+        g.setFont (12.0f);
+        g.drawText ("Reversa", getLocalBounds().removeFromBottom (18), juce::Justification::centred);
+    }
+};
+
+// Dos opciones apiladas, la activa en amarillo (Mono/Poly y Mantener/Una vez)
+class StackedToggle : public juce::Component
+{
+public:
+    using DrawFn = std::function<void (juce::Graphics&, juce::Rectangle<float>, juce::Colour)>;
+    DrawFn drawTop, drawBottom;
+    std::function<void (bool)> onChange;   // true = quedo activa la parte de abajo
+    bool bottomActive = false;
+
+    void setBottomActive (bool b)
+    {
+        if (b != bottomActive)
+        {
+            bottomActive = b;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        auto b = getLocalBounds().toFloat();
+        g.setColour (TongaColours::inset);
+        g.fillRoundedRectangle (b, 6.0f);
+
+        auto top = b.removeFromTop (b.getHeight() * 0.5f);
+        auto bot = b;
+        const juce::Colour on = TongaColours::yellow;
+        const juce::Colour off (0xff6c6c78);
+        if (drawTop)    drawTop (g, top.reduced (4.0f, 2.0f), bottomActive ? off : on);
+        if (drawBottom) drawBottom (g, bot.reduced (4.0f, 2.0f), bottomActive ? on : off);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const bool bottom = e.y >= getHeight() / 2;
+        if (bottom != bottomActive)
+        {
+            bottomActive = bottom;
+            repaint();
+            if (onChange)
+                onChange (bottom);
         }
     }
 };
 
 //==============================================================================
 // Vista de la onda: click = poner el cursor, arrastrar = mover, rueda = zoom.
-// Se pueden arrastrar los bordes del pad seleccionado y, en modo grilla, las barras A y B.
 class WaveView : public juce::Component
 {
 public:
@@ -132,7 +214,12 @@ public:
 
     void setSelectedPad (int pad) { selectedPad = pad; repaint(); }
     void showPad (int pad);
+    void showTime (double sec);
     void resetView();
+
+    double getViewStart() const { return viewStart; }
+    double getViewLen() const { return viewLen; }
+    void setViewStart (double s);
 
     void setGridMode (bool on);
     bool isGridMode() const { return gridMode; }
@@ -155,6 +242,25 @@ private:
     DragKind drag = dragNone;
     double dragStartView = 0.0;
 
+    std::vector<float> mins, maxs;
+};
+
+// Franja con todo el audio y un recuadro de la zona que se ve abajo
+class OverviewView : public juce::Component
+{
+public:
+    OverviewView (TongaProcessor& p, WaveView& w) : proc (p), wave (w) {}
+
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent& e) override { moveTo (e); }
+    void mouseDrag (const juce::MouseEvent& e) override { moveTo (e); }
+
+private:
+    void moveTo (const juce::MouseEvent& e);
+
+    TongaProcessor& proc;
+    WaveView& wave;
+    juce::String cacheKey;
     std::vector<float> mins, maxs;
 };
 
@@ -188,6 +294,7 @@ public:
     void filesDropped (const juce::StringArray& files, int x, int y) override;
 
 private:
+    // Un control de ajuste por pad: perilla o caja con flechitas
     struct Fader
     {
         juce::Label name;
@@ -196,10 +303,11 @@ private:
         std::function<float (const PadSlice&)> read;
     };
 
-    void setupFader (int i, const juce::String& label, double mn, double mx, double step, double def,
+    void setupFader (int i, const juce::String& label, bool knob, double mn, double mx, double step, double def,
                      std::function<juce::String (double)> text,
                      std::function<void (PadSlice&, float)> apply,
                      std::function<float (const PadSlice&)> read);
+    void styleIncDec (juce::Slider& s, int textW);
 
     void timerCallback() override;
     void loadSample (const juce::File& f);
@@ -208,29 +316,50 @@ private:
     void syncPadControls();
     void doSlicing (int mode);
     void applyToSelected (const std::function<void (PadSlice&)>& fn);
+    void scaleStretch (double factor);
+    void scaleOriginalBpm (double factor);
+    void stepDivision (int delta);
+    void shiftSlicer (int dir);
 
     TongaLook look;
     TongaProcessor& proc;
 
     WaveView wave;
+    OverviewView overview;
+
+    // Encabezado
     juce::ImageComponent logo;
-    juce::Label title, sampleLabel, bpmLabel, hintLabel, masterLabel;
+    juce::Label title;
     juce::TextButton loadButton { "Cargar audio" };
-    juce::TextButton syncButton { "Sync" };
+
+    // Franja de informacion
+    juce::Rectangle<int> infoStrip, knobPanel;
+    juce::Label sampleLabel, bpmLabel, sigCaption, timeLabel;
+    juce::TextButton bpmHalf { "1/2" }, bpmDouble { "x2" };
     juce::ComboBox timeSigBox;
-    juce::Slider bpmSlider;
 
+    // Fila de control
     PlayButton playButton;
-    juce::TextButton polyButton { "Poly" };
-    juce::TextButton holdButton { "Mantener" };
-    juce::TextButton gridButton { "Grilla" }, saveGridButton { "Guardar" }, cancelGridButton { "Cancelar" };
-    juce::TextButton autoButton { "Auto" };
-    juce::ComboBox divisionBox;
-    juce::TextButton selectAllButton { "Todos" }, clearButton { "Limpiar" };
+    StackedToggle holdToggle, polyToggle;
+    juce::Slider bpmBox, keyBox, detuneBox;
+    juce::Label keyLabel, detuneLabel;
+    juce::TextButton syncButton { "SYNC" };
 
-    std::array<Fader, 7> faders;
-    juce::Slider masterSlider;
-    juce::TextButton reverseButton { "Reversa" };
+    // Perillas y cajas del pad seleccionado
+    std::array<Fader, 6> faders;       // 0-3 perillas, 4 velocidad, 5 tono del pad
+    ReverseButton reverseButton;
+    juce::TextButton stretchHalf { "1/2" }, stretchDouble { "x2" };
+
+    // Fila de abajo
+    juce::ComboBox modeBox;
+    juce::ArrowButton pageLeft { "pl", 0.5f, TongaColours::pink };
+    juce::ArrowButton pageRight { "pr", 0.0f, TongaColours::pink };
+    juce::ArrowButton divDec { "dd", 0.5f, TongaColours::yellow };
+    juce::ArrowButton divInc { "di", 0.0f, TongaColours::yellow };
+    juce::Label divLabel, hintLabel;
+    juce::TextButton rerollButton { "Otra vez" };
+    juce::TextButton selectAllButton { "Seleccionar todos" }, clearButton { "Limpiar" };
+    juce::TextButton gridButton { "Grilla" }, saveGridButton { "Guardar" }, cancelGridButton { "Cancelar" };
 
     PadComp pads[TongaProcessor::numPads];
 
@@ -242,9 +371,9 @@ private:
 
     std::unique_ptr<juce::FileChooser> chooser;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> syncAtt, polyAtt, holdAtt;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> sigAtt, divAtt;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> bpmAtt, masterAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> syncAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> sigAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> bpmAtt, keyAtt, detuneAtt;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaEditor)
 };

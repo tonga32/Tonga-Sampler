@@ -15,7 +15,6 @@ struct PadSlice
     float gain = 1.0f;
     bool reverse = false;
     int keyShift = 0;        // semitonos
-    float detune = 0.0f;     // cents
     float stretch = 0.0f;    // % de velocidad (0 = original)
     float filter = 0.0f;     // -1 = pasa bajos, 0 = apagado, +1 = pasa altos
     float attack = 0.0f;     // segundos
@@ -25,7 +24,7 @@ struct PadSlice
 class TongaProcessor : public juce::AudioProcessor
 {
 public:
-    static constexpr int numPads = 16;
+    static constexpr int numPads = 32;
     enum SliceMode { modeSlicer = 0, modeTransient = 1, modeSamples = 2, modeRandom = 3 };
 
     TongaProcessor();
@@ -130,14 +129,15 @@ private:
 
     void detectTempo();
     void buildTables (double sr);
-    void startVoice (int pad, int delaySamples);
+    bool startVoice (int pad, int delaySamples);
     void initVoice (Voice& v, double startS, double endS, bool rev, int delaySamples);
     void releaseVoice (Voice& v, double seconds);
     void renderVoice (Voice& v, const PadSlice& sp, float* outL, float* outR, int n,
-                      double tempoRatio, float master);
+                      double tempoRatio, float master, double globalSemis);
 
     juce::AudioFormatManager formatManager;
     juce::CriticalSection dataLock;
+    juce::CriticalSection peakLock;
 
     juce::AudioBuffer<float> sample;
     double fileSampleRate = 44100.0;
@@ -160,7 +160,7 @@ private:
     std::atomic<double> gridOffset { 0.0 };
     std::atomic<double> appliedBpm { 120.0 };
     std::atomic<double> cursorSec { 0.0 };
-    std::atomic<int> lastMode { modeSlicer };
+    std::atomic<int> lastMode { -1 };
     std::atomic<uint32_t> pendingMask { 0 };
     std::atomic<uint32_t> pendingRelease { 0 };
     std::atomic<int> auditionCmd { 0 };
@@ -173,6 +173,8 @@ private:
     std::atomic<float>* polyParam = nullptr;
     std::atomic<float>* holdParam = nullptr;
     std::atomic<float>* volumeParam = nullptr;
+    std::atomic<float>* gkeyParam = nullptr;
+    std::atomic<float>* gdetuneParam = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaProcessor)
 };

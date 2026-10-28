@@ -151,15 +151,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout TongaProcessor::createLayout
 
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "sync", 1 }, "Sync DAW", true));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "bpm", 1 }, "BPM",
-                                                             juce::NormalisableRange<float> (40.0f, 300.0f, 0.01f), 120.0f));
+                                                             juce::NormalisableRange<float> (40.0f, 300.0f, 0.1f), 120.0f));
     layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "timesig", 1 }, "Compas",
                                                               juce::StringArray { "2/4", "3/4", "4/4", "6/8", "9/8", "12/8" }, 2));
     layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "division", 1 }, "Division del slicer",
-                                                              juce::StringArray { "1/4 negra", "1/2 negra", "1 negra", "1/2 compas", "1 compas", "2 compases" }, 2));
+                                                              juce::StringArray { "1/4", "1/2", "1", "2", "4" }, 2));
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "poly", 1 }, "Poly", true));
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "hold", 1 }, "Mantener", false));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "volume", 1 }, "Volumen",
                                                              juce::NormalisableRange<float> (0.0f, 2.0f, 0.01f), 1.0f));
+    layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "gkey", 1 }, "Key", -12, 12, 0));
+    layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "gdetune", 1 }, "Detune",
+                                                             juce::NormalisableRange<float> (-100.0f, 100.0f, 1.0f), 0.0f));
     return layout;
 }
 
@@ -175,6 +178,8 @@ TongaProcessor::TongaProcessor()
     polyParam     = apvts.getRawParameterValue ("poly");
     holdParam     = apvts.getRawParameterValue ("hold");
     volumeParam   = apvts.getRawParameterValue ("volume");
+    gkeyParam     = apvts.getRawParameterValue ("gkey");
+    gdetuneParam  = apvts.getRawParameterValue ("gdetune");
 
     buildTables (44100.0);
 }
@@ -333,13 +338,17 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid)
         const juce::ScopedLock sl (dataLock);
         sample = std::move (tmp);
         fileSampleRate = reader->sampleRate;
-        peakMin = std::move (mins);
-        peakMax = std::move (maxs);
         samplePath = file.getFullPathName();
         sampleLengthSec.store ((double) len / fileSampleRate);
         for (auto& v : voices) v.active = false;
         for (auto& sl2 : slices) sl2 = PadSlice();
         cursorSec.store (0.0);
+    }
+
+    {
+        const juce::ScopedLock pl (peakLock);
+        peakMin = std::move (mins);
+        peakMax = std::move (maxs);
     }
 
     if (detectGrid)
@@ -353,7 +362,7 @@ void TongaProcessor::getPeaks (double startSec, double lenSec, int columns,
     mins.assign ((size_t) juce::jmax (0, columns), 0.0f);
     maxs.assign ((size_t) juce::jmax (0, columns), 0.0f);
 
-    const juce::ScopedLock sl (dataLock);
+    const juce::ScopedLock sl (peakLock);
     const int nb = (int) peakMin.size();
     if (nb == 0 || columns <= 0 || lenSec <= 0.0)
         return;
@@ -428,9 +437,8 @@ void TongaProcessor::applySlicing (int mode)
 
     if (mode == modeSlicer)
     {
-        const double qpb = getQuartersPerBar();
-        const double steps[6] = { beat * 0.25, beat * 0.5, beat, beat * qpb * 0.5, beat * qpb, beat * qpb * 2.0 };
-        const int di = juce::jlimit (0, 5, (int) divisionParam->load());
+        const double steps[5] = { beat * 0.25, beat * 0.5, beat, beat * 2.0, beat * 4.0 };
+        const int di = juce::jlimit (0, 4, (int) divisionParam->load());
         const double step = steps[di];
         const double off = gridOffset.load();
         const double cur = cursorSec.load();
@@ -578,12 +586,12 @@ void TongaProcessor::releaseVoice (Voice& v, double seconds)
     v.releasing = true;
 }
 
-void TongaProcessor::startVoice (int pad, int delaySamples)
+bool TongaProcessor::startVoice (int pad, int delaySamples)
 {
     // Se llama con dataLock tomado (desde processBlock)
     const int total = sample.getNumSamples();
     if (total == 0)
-        return;
+        return false;
 
     auto& sl = slices[(size_t) pad];
 
@@ -600,7 +608,7 @@ void TongaProcessor::startVoice (int pad, int delaySamples)
     const double startS = juce::jmax (0.0, sl.start * fileSampleRate);
     const double endS = juce::jmin ((double) total, sl.end * fileSampleRate);
     if (endS - startS < 2.0)
-        return;
+        return false;
 
     // Mono: un solo sample a la vez, el nuevo corta a los anteriores
     if (polyParam->load() < 0.5f)
@@ -612,14 +620,15 @@ void TongaProcessor::startVoice (int pad, int delaySamples)
 
     lastPlayedPad.store (pad);
     playCounter.fetch_add (1);
+    return true;
 }
 
 void TongaProcessor::renderVoice (Voice& v, const PadSlice& sp, float* outL, float* outR, int n,
-                                  double tempoRatio, float master)
+                                  double tempoRatio, float master, double globalSemis)
 {
     const double srcPerOut = fileSampleRate / hostSampleRate;
     const double speed = juce::jlimit (0.25, 4.0, tempoRatio * (1.0 + (double) sp.stretch / 100.0));
-    const double pitch = std::pow (2.0, ((double) sp.keyShift + (double) sp.detune / 100.0) / 12.0);
+    const double pitch = std::pow (2.0, ((double) sp.keyShift + globalSemis) / 12.0);
     const double dir = v.rev ? -1.0 : 1.0;
     const double gStep = pitch * srcPerOut * dir;
     const double anchorStep = (double) hop * speed * srcPerOut * dir;
@@ -818,21 +827,27 @@ void TongaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
     const double applied = (sync && hostBpm > 1.0) ? hostBpm : (double) bpmParam->load();
     appliedBpm.store (applied);
 
-    const uint32_t uiTriggers = pendingMask.exchange (0);
-    const uint32_t uiReleases = pendingRelease.exchange (0);
-    const int auditionNow = auditionCmd.exchange (0);
-
+    // Si la interfaz esta usando los datos en este instante, se saltea este bloque.
+    // Los pedidos pendientes (tocar / soltar un pad) NO se pierden: quedan para el siguiente.
     const juce::ScopedTryLock tryLock (dataLock);
     if (! tryLock.isLocked())
         return;
 
+    const uint32_t uiTriggers = pendingMask.exchange (0);
+    const uint32_t uiReleases = pendingRelease.exchange (0);
+    const int auditionNow = auditionCmd.exchange (0);
+
     const bool hold = holdParam->load() > 0.5f;
     const int total = sample.getNumSamples();
 
-    // Eventos: UI y MIDI (notas 36 a 51 = pads 1 a 16)
+    uint32_t started = 0;   // pads que arrancaron en este bloque
+    uint32_t deferred = 0;  // "soltar" que llegaron junto con el "tocar": se aplican en el bloque siguiente
+
+    // Eventos: UI y MIDI (notas 36 a 67 = pads 1 a 32)
     for (int i = 0; i < numPads; ++i)
         if (uiTriggers & (1u << i))
-            startVoice (i, 0);
+            if (startVoice (i, 0))
+                started |= (1u << i);
 
     for (const auto meta : midi)
     {
@@ -841,20 +856,38 @@ void TongaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
         {
             const int pad = m.getNoteNumber() - 36;
             if (pad >= 0 && pad < numPads)
-                startVoice (pad, meta.samplePosition);
+                if (startVoice (pad, meta.samplePosition))
+                    started |= (1u << pad);
         }
         else if (m.isNoteOff() && hold)
         {
             const int pad = m.getNoteNumber() - 36;
             if (pad >= 0 && pad < numPads)
-                releaseVoice (voices[(size_t) pad], (double) slices[(size_t) pad].release);
+            {
+                if (started & (1u << pad))
+                    deferred |= (1u << pad);
+                else
+                    releaseVoice (voices[(size_t) pad], (double) slices[(size_t) pad].release);
+            }
         }
     }
 
     if (hold)
+    {
         for (int i = 0; i < numPads; ++i)
+        {
             if (uiReleases & (1u << i))
-                releaseVoice (voices[(size_t) i], (double) slices[(size_t) i].release);
+            {
+                if (started & (1u << i))
+                    deferred |= (1u << i);
+                else
+                    releaseVoice (voices[(size_t) i], (double) slices[(size_t) i].release);
+            }
+        }
+    }
+
+    if (deferred != 0)
+        pendingRelease.fetch_or (deferred);
 
     // Play / pausa del audio completo
     if (total > 0)
@@ -879,6 +912,7 @@ void TongaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
 
     const double ratio = applied / juce::jmax (1.0, originalBpm.load());
     const float master = volumeParam->load();
+    const double globalSemis = (double) gkeyParam->load() + (double) gdetuneParam->load() / 100.0;
 
     float* outL = buffer.getWritePointer (0);
     float* outR = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
@@ -891,14 +925,14 @@ void TongaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
         if (! v.active)
             continue;
 
-        renderVoice (v, slices[(size_t) pad], outL, outR, n, ratio, master);
+        renderVoice (v, slices[(size_t) pad], outL, outR, n, ratio, master, globalSemis);
         if (v.active)
             playing |= (1u << pad);
     }
 
     auto& av = voices[(size_t) numPads];
     if (av.active)
-        renderVoice (av, auditionParams, outL, outR, n, ratio, master);
+        renderVoice (av, auditionParams, outL, outR, n, ratio, master, globalSemis);
 
     playingMask.store (playing);
     auditioning.store (av.active);
@@ -923,7 +957,7 @@ void TongaProcessor::getStateInformation (juce::MemoryBlock& destData)
         for (auto& s : slices)
             sl << (s.valid ? 1 : 0) << "," << s.start << "," << s.end << ","
                << s.gain << "," << (s.reverse ? 1 : 0) << ","
-               << s.keyShift << "," << s.detune << "," << s.stretch << ","
+               << s.keyShift << "," << s.stretch << ","
                << s.filter << "," << s.attack << "," << s.release << ";";
         state.setProperty ("samplePath", samplePath, nullptr);
     }
@@ -956,7 +990,7 @@ void TongaProcessor::setStateInformation (const void* data, int sizeInBytes)
 
     originalBpm.store ((double) vt.getProperty ("origBpm", 120.0));
     gridOffset.store ((double) vt.getProperty ("gridOffset", 0.0));
-    lastMode.store ((int) vt.getProperty ("lastMode", 0));
+    lastMode.store ((int) vt.getProperty ("lastMode", -1));
     if (hasSample())
         setCursor ((double) vt.getProperty ("cursor", 0.0));
 
@@ -976,14 +1010,13 @@ void TongaProcessor::setStateInformation (const void* data, int sizeInBytes)
                 s.end = f[2].getDoubleValue();
                 s.gain = (float) f[3].getDoubleValue();
                 s.reverse = f[4].getIntValue() != 0;
-                if (f.size() >= 11)
+                if (f.size() == 10)
                 {
                     s.keyShift = f[5].getIntValue();
-                    s.detune = (float) f[6].getDoubleValue();
-                    s.stretch = (float) f[7].getDoubleValue();
-                    s.filter = (float) f[8].getDoubleValue();
-                    s.attack = (float) f[9].getDoubleValue();
-                    s.release = (float) f[10].getDoubleValue();
+                    s.stretch = (float) f[6].getDoubleValue();
+                    s.filter = (float) f[7].getDoubleValue();
+                    s.attack = (float) f[8].getDoubleValue();
+                    s.release = (float) f[9].getDoubleValue();
                 }
             }
         }
