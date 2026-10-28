@@ -5,7 +5,8 @@
 #include <atomic>
 #include <vector>
 
-// Un corte (slice) asignado a un pad. Las posiciones estan en segundos del audio original.
+// Un corte (slice) asignado a un pad, con sus ajustes propios.
+// Las posiciones estan en segundos del audio original.
 struct PadSlice
 {
     bool valid = false;
@@ -13,6 +14,12 @@ struct PadSlice
     double end = 0.0;
     float gain = 1.0f;
     bool reverse = false;
+    int keyShift = 0;        // semitonos
+    float detune = 0.0f;     // cents
+    float stretch = 0.0f;    // % de velocidad (0 = original)
+    float filter = 0.0f;     // -1 = pasa bajos, 0 = apagado, +1 = pasa altos
+    float attack = 0.0f;     // segundos
+    float release = 0.02f;   // segundos
 };
 
 class TongaProcessor : public juce::AudioProcessor
@@ -64,6 +71,13 @@ public:
     double getAppliedBpm() const { return appliedBpm.load(); }
     void setGrid (double offsetSec, double newOriginalBpm);
 
+    // --- Cursor y reproduccion del audio completo ---
+    double getCursor() const { return cursorSec.load(); }
+    void setCursor (double s) { cursorSec.store (juce::jlimit (0.0, juce::jmax (0.0, getLengthSec()), s)); }
+    void toggleAudition();
+    bool isAuditioning() const { return auditioning.load(); }
+    double getAuditionPos() const { return auditionPosSec.load(); }
+
     // --- Pads ---
     PadSlice getSlice (int pad);
     void setSlice (int pad, const PadSlice& s);
@@ -73,6 +87,7 @@ public:
     int getLastMode() const { return lastMode.load(); }
 
     void triggerPad (int pad);
+    void releasePad (int pad);
 
     // Informacion para la interfaz
     std::atomic<int> lastPlayedPad { 0 };
@@ -83,21 +98,43 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
 private:
+    struct Grain
+    {
+        bool on = false;
+        bool first = false;
+        double pos = 0.0;
+        int age = 0;
+    };
+
     struct Voice
     {
         bool active = false;
-        double pos = 0.0;
+        bool releasing = false;
+        bool ended = false;
+        bool rev = false;
         double startS = 0.0;
         double endS = 0.0;
-        float gain = 1.0f;
-        bool rev = false;
+        double anchor = 0.0;
         int delay = 0;
+        int sinceSpawn = 0;
+        int spawned = 0;
+        int lastGrain = -1;
+        float env = 0.0f;
+        float relInc = 0.0f;
+        float ic1[2] = { 0.0f, 0.0f };
+        float ic2[2] = { 0.0f, 0.0f };
+        Grain grains[3];
     };
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
     void detectTempo();
+    void buildTables (double sr);
     void startVoice (int pad, int delaySamples);
+    void initVoice (Voice& v, double startS, double endS, bool rev, int delaySamples);
+    void releaseVoice (Voice& v, double seconds);
+    void renderVoice (Voice& v, const PadSlice& sp, float* outL, float* outR, int n,
+                      double tempoRatio, float master);
 
     juce::AudioFormatManager formatManager;
     juce::CriticalSection dataLock;
@@ -112,17 +149,29 @@ private:
     std::vector<float> peakMin, peakMax;
 
     std::array<PadSlice, numPads> slices;
-    std::array<Voice, numPads> voices;
+    std::array<Voice, numPads + 1> voices;   // el ultimo es el del play del audio completo
+    PadSlice auditionParams;
+
+    int hop = 1102;
+    int grainLen = 2204;
+    std::vector<float> hannWin, firstWin;
 
     std::atomic<double> originalBpm { 120.0 };
     std::atomic<double> gridOffset { 0.0 };
     std::atomic<double> appliedBpm { 120.0 };
+    std::atomic<double> cursorSec { 0.0 };
     std::atomic<int> lastMode { modeSlicer };
     std::atomic<uint32_t> pendingMask { 0 };
+    std::atomic<uint32_t> pendingRelease { 0 };
+    std::atomic<int> auditionCmd { 0 };
+    std::atomic<bool> auditioning { false };
+    std::atomic<double> auditionPosSec { 0.0 };
 
     std::atomic<float>* syncParam = nullptr;
     std::atomic<float>* bpmParam = nullptr;
-    std::atomic<float>* sizeParam = nullptr;
+    std::atomic<float>* divisionParam = nullptr;
+    std::atomic<float>* polyParam = nullptr;
+    std::atomic<float>* holdParam = nullptr;
     std::atomic<float>* volumeParam = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaProcessor)

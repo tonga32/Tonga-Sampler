@@ -1,12 +1,9 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
 
-namespace
-{
-    const juce::Colour yellow (0xffffd200);
-    const juce::Colour pink   (0xfff98aa0);
-    const juce::Colour bgDark (0xff17171c);
-}
+using TongaColours::yellow;
+using TongaColours::pink;
+using TongaColours::bgDark;
 
 //==============================================================================
 // WaveView
@@ -47,8 +44,8 @@ void WaveView::showPad (int pad)
     if (len * 1.2 > viewLen)
         viewLen = len * 1.4;
 
-    if (s.start < viewStart || s.end > viewStart + viewLen)
-        viewStart = (s.start + s.end) * 0.5 - viewLen * 0.5;
+    if (s.start < viewStart || s.start > viewStart + viewLen)
+        viewStart = s.start - viewLen * 0.1;
 
     clampView();
     repaint();
@@ -90,7 +87,7 @@ void WaveView::commitGrid()
 
 void WaveView::paint (juce::Graphics& g)
 {
-    g.fillAll (juce::Colour (0xff101015));
+    g.fillAll (juce::Colour (0xff0e0e13));
 
     if (! proc.hasSample())
     {
@@ -104,7 +101,7 @@ void WaveView::paint (juce::Graphics& g)
     const int h = getHeight();
     const float mid = (float) h * 0.5f;
 
-    // Bandas de los pads
+    // Bandas de los pads asignados
     for (int i = 0; i < TongaProcessor::numPads; ++i)
     {
         const auto s = proc.getSlice (i);
@@ -116,7 +113,7 @@ void WaveView::paint (juce::Graphics& g)
         if (x1 < 0.0f || x0 > (float) w)
             continue;
 
-        g.setColour (i == selectedPad ? yellow.withAlpha (0.20f) : pink.withAlpha (0.08f));
+        g.setColour (i == selectedPad ? yellow.withAlpha (0.16f) : pink.withAlpha (0.07f));
         g.fillRect (x0, 0.0f, juce::jmax (1.0f, x1 - x0), (float) h);
 
         g.setColour (juce::Colours::white.withAlpha (0.55f));
@@ -158,7 +155,7 @@ void WaveView::paint (juce::Graphics& g)
 
                 if (pxBeat >= 14.0)
                 {
-                    g.setColour (juce::Colours::white.withAlpha (0.10f));
+                    g.setColour (juce::Colours::white.withAlpha (0.08f));
                     for (int j = 1; (double) j * beatS < barS - 1.0e-6; ++j)
                     {
                         const double t = tBar + (double) j * beatS;
@@ -169,16 +166,16 @@ void WaveView::paint (juce::Graphics& g)
 
                 if (tBar >= 0.0 && tBar >= viewStart)
                 {
-                    g.setColour (yellow.withAlpha (0.45f));
+                    g.setColour (yellow.withAlpha (0.35f));
                     g.drawVerticalLine ((int) secToX (tBar), 0.0f, (float) h);
                 }
             }
         }
     }
 
-    // Modo grilla: manijas A y B
     if (gridMode)
     {
+        // Manijas A y B
         const float xa = secToX (gridA);
         const float xb = secToX (gridB);
         g.setColour (pink);
@@ -193,17 +190,36 @@ void WaveView::paint (juce::Graphics& g)
     }
     else
     {
-        // Bordes del pad seleccionado
+        // Marcas de inicio y fin del pad seleccionado (se arrastran)
         const auto s = proc.getSlice (selectedPad);
         if (s.valid)
         {
+            const float xs = secToX (s.start);
+            const float xe = secToX (s.end);
             g.setColour (yellow);
-            g.fillRect (secToX (s.start) - 1.0f, 0.0f, 2.0f, (float) h);
-            g.fillRect (secToX (s.end) - 1.0f, 0.0f, 2.0f, (float) h);
+            g.fillRect (xs - 1.0f, 0.0f, 2.0f, (float) h);
+            g.fillRect (xe - 1.0f, 0.0f, 2.0f, (float) h);
+
+            juce::Path tri;
+            tri.addTriangle (xs, 0.0f, xs + 11.0f, 0.0f, xs, 11.0f);
+            tri.addTriangle (xe, 0.0f, xe - 11.0f, 0.0f, xe, 11.0f);
+            g.fillPath (tri);
         }
     }
 
-    // Cabezal de reproduccion
+    // Cursor (donde se asigna un pad vacio y desde donde suena el play)
+    const double cur = proc.isAuditioning() ? proc.getAuditionPos() : proc.getCursor();
+    const float xc = secToX (cur);
+    if (xc >= -2.0f && xc <= (float) w + 2.0f)
+    {
+        g.setColour (juce::Colours::white);
+        g.fillRect (xc - 1.0f, 0.0f, 2.0f, (float) h);
+        juce::Path tri;
+        tri.addTriangle (xc - 6.0f, (float) h, xc + 6.0f, (float) h, xc, (float) h - 9.0f);
+        g.fillPath (tri);
+    }
+
+    // Cabezal del pad que esta sonando
     const double pos = proc.lastPlayPosSec.load();
     if (pos >= 0.0)
     {
@@ -235,7 +251,6 @@ void WaveView::mouseDown (const juce::MouseEvent& e)
             else if (std::abs (x - secToX (s.end)) < 8.0f)   drag = dragPadEnd;
         }
     }
-    lastDragSec = xToSec (x);
 }
 
 void WaveView::mouseDrag (const juce::MouseEvent& e)
@@ -255,7 +270,7 @@ void WaveView::mouseDrag (const juce::MouseEvent& e)
 
         case dragGridA:
         {
-            const double newA = juce::jmax (0.0, gridA + (t - gridA));
+            const double newA = juce::jmax (0.0, t);
             const double d = newA - gridA;
             gridA += d;
             gridB += d;
@@ -287,8 +302,14 @@ void WaveView::mouseDrag (const juce::MouseEvent& e)
     repaint();
 }
 
-void WaveView::mouseUp (const juce::MouseEvent&)
+void WaveView::mouseUp (const juce::MouseEvent& e)
 {
+    // Un click simple (sin arrastrar) pone el cursor
+    if (drag == dragScroll && ! gridMode && e.getDistanceFromDragStart() < 4 && proc.hasSample())
+    {
+        proc.setCursor (xToSec ((float) e.x));
+        repaint();
+    }
     drag = dragNone;
 }
 
@@ -315,18 +336,18 @@ void PadComp::paint (juce::Graphics& g)
 {
     auto b = getLocalBounds().toFloat().reduced (3.0f);
 
-    juce::Colour base = hasSlice ? juce::Colour (0xff2b2b35) : juce::Colour (0xff1d1d24);
+    juce::Colour base = hasSlice ? juce::Colour (0xff2e2e38) : juce::Colour (0xff1a1a20);
     if (playing)
         base = pink;
 
     g.setColour (base);
     g.fillRoundedRectangle (b, 8.0f);
 
-    g.setColour (selected ? yellow : juce::Colour (0xff3a3a46));
-    g.drawRoundedRectangle (b, 8.0f, selected ? 2.5f : 1.0f);
+    g.setColour (selected ? yellow : juce::Colour (0xff33333d));
+    g.drawRoundedRectangle (b, 8.0f, selected ? 2.0f : 1.0f);
 
     g.setColour (playing ? juce::Colours::black : (hasSlice ? juce::Colours::white : juce::Colours::grey));
-    g.setFont (juce::Font (16.0f, juce::Font::bold));
+    g.setFont (juce::Font (15.0f, juce::Font::bold));
     g.drawText (juce::String (index + 1), getLocalBounds(), juce::Justification::centred);
 }
 
@@ -336,12 +357,53 @@ void PadComp::mouseDown (const juce::MouseEvent& e)
         onDown (index, e.mods);
 }
 
+void PadComp::mouseUp (const juce::MouseEvent&)
+{
+    if (onUp)
+        onUp (index);
+}
+
 //==============================================================================
 // TongaEditor
 //==============================================================================
+void TongaEditor::setupFader (int i, const juce::String& label, double mn, double mx, double step, double def,
+                              std::function<juce::String (double)> text,
+                              std::function<void (PadSlice&, float)> apply,
+                              std::function<float (const PadSlice&)> read)
+{
+    auto& f = faders[(size_t) i];
+
+    f.name.setText (label, juce::dontSendNotification);
+    f.name.setJustificationType (juce::Justification::centred);
+    f.name.setFont (juce::Font (12.0f));
+    f.name.setColour (juce::Label::textColourId, juce::Colours::grey);
+    addAndMakeVisible (f.name);
+
+    f.slider.setSliderStyle (juce::Slider::LinearVertical);
+    f.slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 16);
+    f.slider.setTextBoxIsEditable (false);
+    f.slider.setRange (mn, mx, step);
+    f.slider.setDoubleClickReturnValue (true, def);
+    f.slider.textFromValueFunction = text;
+    f.slider.setValue (def, juce::dontSendNotification);
+
+    f.apply = apply;
+    f.read = read;
+    f.slider.onValueChange = [this, i]
+    {
+        if (updatingControls)
+            return;
+        const float v = (float) faders[(size_t) i].slider.getValue();
+        auto fn = faders[(size_t) i].apply;
+        applyToSelected ([fn, v] (PadSlice& s) { fn (s, v); });
+    };
+    addAndMakeVisible (f.slider);
+}
+
 TongaEditor::TongaEditor (TongaProcessor& p)
     : AudioProcessorEditor (&p), proc (p), wave (p)
 {
+    setLookAndFeel (&look);
     setSize (960, 640);
 
     addAndMakeVisible (wave);
@@ -352,13 +414,15 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     addAndMakeVisible (logo);
 
     title.setText ("Tonga Sampler 2", juce::dontSendNotification);
-    title.setFont (juce::Font (26.0f, juce::Font::bold));
+    title.setFont (juce::Font (20.0f, juce::Font::bold));
     title.setColour (juce::Label::textColourId, yellow);
     addAndMakeVisible (title);
 
     sampleLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+    sampleLabel.setFont (juce::Font (12.0f));
     addAndMakeVisible (sampleLabel);
 
+    // --- Encabezado ---
     addAndMakeVisible (loadButton);
     loadButton.onClick = [this]
     {
@@ -373,15 +437,15 @@ TongaEditor::TongaEditor (TongaProcessor& p)
                               });
     };
 
-    addAndMakeVisible (syncToggle);
-    syncAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "sync", syncToggle);
+    addAndMakeVisible (syncButton);
+    syncAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "sync", syncButton);
 
     timeSigBox.addItemList (juce::StringArray { "2/4", "3/4", "4/4", "6/8", "9/8", "12/8" }, 1);
     addAndMakeVisible (timeSigBox);
     sigAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "timesig", timeSigBox);
 
     bpmSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    bpmSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 60, 20);
+    bpmSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 56, 20);
     addAndMakeVisible (bpmSlider);
     bpmAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "bpm", bpmSlider);
 
@@ -389,8 +453,15 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     bpmLabel.setColour (juce::Label::textColourId, yellow);
     addAndMakeVisible (bpmLabel);
 
-    hintLabel.setColour (juce::Label::textColourId, pink);
-    addAndMakeVisible (hintLabel);
+    // --- Transporte ---
+    addAndMakeVisible (playButton);
+    playButton.onClick = [this] { proc.toggleAudition(); };
+
+    addAndMakeVisible (polyButton);
+    polyAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "poly", polyButton);
+
+    addAndMakeVisible (holdButton);
+    holdAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "hold", holdButton);
 
     addAndMakeVisible (gridButton);
     addChildComponent (saveGridButton);
@@ -399,24 +470,31 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     saveGridButton.onClick = [this] { wave.commitGrid(); syncPadControls(); };
     cancelGridButton.onClick = [this] { wave.setGridMode (false); };
 
-    const char* modeNames[4] = { "Slicer", "Transientes", "Samples", "Random" };
-    for (int i = 0; i < 4; ++i)
-    {
-        modeButtons[i].setButtonText (modeNames[i]);
-        modeButtons[i].setClickingTogglesState (false);
-        modeButtons[i].setColour (juce::TextButton::buttonOnColourId, yellow);
-        modeButtons[i].setColour (juce::TextButton::textColourOnId, juce::Colours::black);
-        modeButtons[i].onClick = [this, i] { doSlicing (i); };
-        addAndMakeVisible (modeButtons[i]);
-    }
+    hintLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+    hintLabel.setFont (juce::Font (12.0f));
+    addAndMakeVisible (hintLabel);
 
-    sizeLabel.setText ("Tamano corte", juce::dontSendNotification);
-    addAndMakeVisible (sizeLabel);
-    sizeSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    sizeSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 50, 20);
-    addAndMakeVisible (sizeSlider);
-    sizeAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "size", sizeSlider);
-    sizeSlider.onValueChange = [this] { needReslice = true; };
+    addAndMakeVisible (autoButton);
+    autoButton.onClick = [this]
+    {
+        juce::PopupMenu m;
+        m.addItem (1, "Slicer (por division)");
+        m.addItem (2, "Transientes");
+        m.addItem (3, "Samples");
+        m.addItem (4, "Random");
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&autoButton),
+                         [this] (int result)
+                         {
+                             if (result > 0)
+                                 doSlicing (result - 1);
+                         });
+    };
+
+    divisionBox.addItemList (juce::StringArray { "1/4 negra", "1/2 negra", "1 negra",
+                                                 "1/2 compas", "1 compas", "2 compases" }, 1);
+    addAndMakeVisible (divisionBox);
+    divAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "division", divisionBox);
+    divisionBox.onChange = [this] { needReslice = true; };
 
     addAndMakeVisible (selectAllButton);
     addAndMakeVisible (clearButton);
@@ -434,42 +512,100 @@ TongaEditor::TongaEditor (TongaProcessor& p)
             if (selMask & (1u << i))
                 proc.clearPad (i);
         refreshPadStates();
+        syncPadControls();
         wave.repaint();
     };
 
-    padGainLabel.setText ("Vol. pad", juce::dontSendNotification);
-    addAndMakeVisible (padGainLabel);
-    padGainSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    padGainSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 50, 20);
-    padGainSlider.setRange (0.0, 2.0, 0.01);
-    padGainSlider.setValue (1.0, juce::dontSendNotification);
-    padGainSlider.onValueChange = [this]
-    {
-        if (updatingControls) return;
-        const float v = (float) padGainSlider.getValue();
-        applyToSelected ([v] (PadSlice& s) { s.gain = v; });
-    };
-    addAndMakeVisible (padGainSlider);
+    // --- Faders del pad seleccionado ---
+    setupFader (0, "Nivel", 0.0, 2.0, 0.01, 1.0,
+                [] (double v) -> juce::String { return juce::String (juce::roundToInt (v * 100.0)) + "%"; },
+                [] (PadSlice& s, float v) { s.gain = v; },
+                [] (const PadSlice& s) { return s.gain; });
 
-    reverseToggle.onClick = [this]
+    setupFader (1, "Filtro", -1.0, 1.0, 0.01, 0.0,
+                [] (double v) -> juce::String
+                {
+                    if (std::abs (v) < 0.02) return "off";
+                    return (v < 0.0 ? juce::String ("LP ") : juce::String ("HP "))
+                           + juce::String (juce::roundToInt (std::abs (v) * 100.0));
+                },
+                [] (PadSlice& s, float v) { s.filter = v; },
+                [] (const PadSlice& s) { return s.filter; });
+
+    setupFader (2, "Ataque", 0.0, 2.0, 0.001, 0.0,
+                [] (double v) -> juce::String
+                {
+                    if (v < 1.0) return juce::String (juce::roundToInt (v * 1000.0)) + " ms";
+                    return juce::String (v, 2) + " s";
+                },
+                [] (PadSlice& s, float v) { s.attack = v; },
+                [] (const PadSlice& s) { return s.attack; });
+    faders[2].slider.setSkewFactorFromMidPoint (0.2);
+
+    setupFader (3, "Release", 0.003, 3.0, 0.001, 0.02,
+                [] (double v) -> juce::String
+                {
+                    if (v < 1.0) return juce::String (juce::roundToInt (v * 1000.0)) + " ms";
+                    return juce::String (v, 2) + " s";
+                },
+                [] (PadSlice& s, float v) { s.release = v; },
+                [] (const PadSlice& s) { return s.release; });
+    faders[3].slider.setSkewFactorFromMidPoint (0.3);
+
+    setupFader (4, "Velocidad", -50.0, 100.0, 1.0, 0.0,
+                [] (double v) -> juce::String
+                {
+                    return juce::String (v > 0.0 ? "+" : "") + juce::String (juce::roundToInt (v)) + "%";
+                },
+                [] (PadSlice& s, float v) { s.stretch = v; },
+                [] (const PadSlice& s) { return s.stretch; });
+
+    setupFader (5, "Tono", -12.0, 12.0, 1.0, 0.0,
+                [] (double v) -> juce::String
+                {
+                    return juce::String (v > 0.0 ? "+" : "") + juce::String (juce::roundToInt (v)) + " st";
+                },
+                [] (PadSlice& s, float v) { s.keyShift = juce::roundToInt (v); },
+                [] (const PadSlice& s) { return (float) s.keyShift; });
+
+    setupFader (6, "Fino", -100.0, 100.0, 1.0, 0.0,
+                [] (double v) -> juce::String
+                {
+                    return juce::String (v > 0.0 ? "+" : "") + juce::String (juce::roundToInt (v)) + " ct";
+                },
+                [] (PadSlice& s, float v) { s.detune = v; },
+                [] (const PadSlice& s) { return s.detune; });
+
+    masterLabel.setText ("Master", juce::dontSendNotification);
+    masterLabel.setJustificationType (juce::Justification::centred);
+    masterLabel.setFont (juce::Font (12.0f));
+    masterLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+    addAndMakeVisible (masterLabel);
+
+    masterSlider.setSliderStyle (juce::Slider::LinearVertical);
+    masterSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 16);
+    masterSlider.setTextBoxIsEditable (false);
+    addAndMakeVisible (masterSlider);
+    masterAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "volume", masterSlider);
+    masterSlider.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v * 100.0)) + "%"; };
+    masterSlider.updateText();
+
+    reverseButton.setClickingTogglesState (true);
+    reverseButton.onClick = [this]
     {
-        if (updatingControls) return;
-        const bool r = reverseToggle.getToggleState();
+        if (updatingControls)
+            return;
+        const bool r = reverseButton.getToggleState();
         applyToSelected ([r] (PadSlice& s) { s.reverse = r; });
     };
-    addAndMakeVisible (reverseToggle);
+    addAndMakeVisible (reverseButton);
 
-    volLabel.setText ("Master", juce::dontSendNotification);
-    addAndMakeVisible (volLabel);
-    volSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    volSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 50, 20);
-    addAndMakeVisible (volSlider);
-    volAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "volume", volSlider);
-
+    // --- Pads ---
     for (int i = 0; i < TongaProcessor::numPads; ++i)
     {
         pads[i].index = i;
         pads[i].onDown = [this] (int pad, const juce::ModifierKeys& m) { padClicked (pad, m); };
+        pads[i].onUp = [this] (int pad) { proc.releasePad (pad); };
         addAndMakeVisible (pads[i]);
     }
 
@@ -486,6 +622,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
 TongaEditor::~TongaEditor()
 {
     stopTimer();
+    setLookAndFeel (nullptr);
 }
 
 void TongaEditor::paint (juce::Graphics& g)
@@ -497,69 +634,81 @@ void TongaEditor::resized()
 {
     auto r = getLocalBounds().reduced (12);
 
-    auto head = r.removeFromTop (64);
-    logo.setBounds (head.removeFromLeft (64));
-    head.removeFromLeft (10);
-    auto left = head.removeFromLeft (250);
-    title.setBounds (left.removeFromTop (36));
-    sampleLabel.setBounds (left);
-    loadButton.setBounds (head.removeFromLeft (100).reduced (0, 16));
+    // Encabezado
+    auto head = r.removeFromTop (44);
+    logo.setBounds (head.removeFromLeft (44).reduced (2));
     head.removeFromLeft (8);
-    syncToggle.setBounds (head.removeFromLeft (100).reduced (0, 16));
-    head.removeFromLeft (8);
-    timeSigBox.setBounds (head.removeFromLeft (80).reduced (0, 16));
-    head.removeFromLeft (8);
-    bpmSlider.setBounds (head.reduced (0, 16));
+    auto tl = head.removeFromLeft (230);
+    title.setBounds (tl.removeFromTop (26));
+    sampleLabel.setBounds (tl);
+    loadButton.setBounds (head.removeFromRight (96).reduced (0, 8));
+    head.removeFromRight (8);
+    timeSigBox.setBounds (head.removeFromRight (70).reduced (0, 8));
+    head.removeFromRight (8);
+    syncButton.setBounds (head.removeFromRight (64).reduced (0, 8));
+    head.removeFromRight (8);
+    bpmSlider.setBounds (head.removeFromRight (170).reduced (0, 10));
+    head.removeFromRight (8);
+    bpmLabel.setBounds (head.removeFromRight (220));
 
-    r.removeFromTop (8);
-    wave.setBounds (r.removeFromTop (260));
+    // Transporte
     r.removeFromTop (6);
+    auto tr = r.removeFromTop (36);
+    playButton.setBounds (tr.removeFromLeft (36));
+    tr.removeFromLeft (8);
+    polyButton.setBounds (tr.removeFromLeft (64).reduced (0, 4));
+    tr.removeFromLeft (6);
+    holdButton.setBounds (tr.removeFromLeft (90).reduced (0, 4));
+    tr.removeFromLeft (14);
 
-    auto gridRow = r.removeFromTop (30);
-    bpmLabel.setBounds (gridRow.removeFromRight (360));
-    gridButton.setBounds (gridRow.removeFromLeft (120));
-    saveGridButton.setBounds (gridButton.getBounds());
-    cancelGridButton.setBounds (gridButton.getBounds().translated (128, 0).withWidth (100));
-    saveGridButton.setBounds (gridButton.getBounds().withWidth (100));
-    gridRow.removeFromLeft (112);
-    hintLabel.setBounds (gridRow);
+    auto gb = tr.removeFromLeft (172);
+    gridButton.setBounds (gb.removeFromLeft (110).reduced (0, 4));
+    saveGridButton.setBounds (gridButton.getBounds().withWidth (80));
+    cancelGridButton.setBounds (saveGridButton.getBounds().translated (86, 0));
 
+    clearButton.setBounds (tr.removeFromRight (70).reduced (0, 4));
+    tr.removeFromRight (6);
+    selectAllButton.setBounds (tr.removeFromRight (70).reduced (0, 4));
+    tr.removeFromRight (14);
+    divisionBox.setBounds (tr.removeFromRight (110).reduced (0, 4));
+    tr.removeFromRight (6);
+    autoButton.setBounds (tr.removeFromRight (70).reduced (0, 4));
+    hintLabel.setBounds (tr);
+
+    // Onda
+    r.removeFromTop (6);
+    wave.setBounds (r.removeFromTop (210));
+
+    // Faders
     r.removeFromTop (8);
-
-    auto padArea = r.removeFromLeft (400);
-    const int cw = padArea.getWidth() / 4;
-    const int ch = padArea.getHeight() / 4;
-    for (int i = 0; i < TongaProcessor::numPads; ++i)
+    auto fr = r.removeFromTop (150);
+    for (int i = 0; i < 7; ++i)
     {
-        const int col = i % 4;
-        const int row = 3 - i / 4;
-        pads[i].setBounds (padArea.getX() + col * cw, padArea.getY() + row * ch, cw, ch);
+        auto col = fr.removeFromLeft (100);
+        faders[(size_t) i].name.setBounds (col.removeFromTop (16));
+        faders[(size_t) i].slider.setBounds (col);
+    }
+    {
+        auto col = fr.removeFromLeft (100);
+        masterLabel.setBounds (col.removeFromTop (16));
+        masterSlider.setBounds (col);
+    }
+    {
+        auto rest = fr.reduced (16, 0);
+        rest.removeFromTop (18);
+        reverseButton.setBounds (rest.removeFromTop (30));
     }
 
-    r.removeFromLeft (16);
-    const int rowH = 36;
-
-    auto row1 = r.removeFromTop (rowH).reduced (0, 2);
-    const int bw = row1.getWidth() / 4;
-    for (int i = 0; i < 4; ++i)
-        modeButtons[i].setBounds (row1.removeFromLeft (bw).reduced (2, 0));
-
-    auto row2 = r.removeFromTop (rowH);
-    sizeLabel.setBounds (row2.removeFromLeft (100));
-    sizeSlider.setBounds (row2);
-
-    auto row3 = r.removeFromTop (rowH).reduced (0, 2);
-    selectAllButton.setBounds (row3.removeFromLeft (row3.getWidth() / 2).reduced (2, 0));
-    clearButton.setBounds (row3.reduced (2, 0));
-
-    auto row4 = r.removeFromTop (rowH);
-    padGainLabel.setBounds (row4.removeFromLeft (100));
-    reverseToggle.setBounds (row4.removeFromRight (90));
-    padGainSlider.setBounds (row4);
-
-    auto row5 = r.removeFromTop (rowH);
-    volLabel.setBounds (row5.removeFromLeft (100));
-    volSlider.setBounds (row5);
+    // Pads: 8 columnas x 2 filas, el 1 abajo a la izquierda
+    r.removeFromTop (8);
+    const int cw = r.getWidth() / 8;
+    const int ch = r.getHeight() / 2;
+    for (int i = 0; i < TongaProcessor::numPads; ++i)
+    {
+        const int col = i % 8;
+        const int row = 1 - i / 8;
+        pads[i].setBounds (r.getX() + col * cw, r.getY() + row * ch, cw, ch);
+    }
 }
 
 //==============================================================================
@@ -614,7 +763,7 @@ void TongaEditor::padClicked (int pad, const juce::ModifierKeys& mods)
     }
 
     curPad = pad;
-    proc.triggerPad (pad);
+    proc.triggerPad (pad);   // si el pad esta vacio, se asigna en el cursor al sonar
     wave.setSelectedPad (pad);
     syncPadControls();
     refreshPadStates();
@@ -645,8 +794,9 @@ void TongaEditor::syncPadControls()
 {
     updatingControls = true;
     const auto s = proc.getSlice (curPad);
-    padGainSlider.setValue (s.gain, juce::dontSendNotification);
-    reverseToggle.setToggleState (s.reverse, juce::dontSendNotification);
+    for (auto& f : faders)
+        f.slider.setValue ((double) f.read (s), juce::dontSendNotification);
+    reverseButton.setToggleState (s.reverse, juce::dontSendNotification);
     updatingControls = false;
 }
 
@@ -665,22 +815,19 @@ void TongaEditor::applyToSelected (const std::function<void (PadSlice&)>& fn)
         if (selMask & (1u << i))
         {
             auto s = proc.getSlice (i);
-            if (s.valid)
-            {
-                fn (s);
-                proc.setSlice (i, s);
-            }
+            fn (s);
+            proc.setSlice (i, s);
         }
     }
 }
 
 void TongaEditor::timerCallback()
 {
-    // Re-cortar si se movio el control de tamano (en modo Slicer)
+    // Re-cortar si se cambio la division (solo en modo Slicer)
     if (needReslice)
     {
         needReslice = false;
-        if (proc.getLastMode() == TongaProcessor::modeSlicer)
+        if (proc.getLastMode() == TongaProcessor::modeSlicer && proc.getValidMask() != 0)
             proc.applySlicing (TongaProcessor::modeSlicer);
     }
 
@@ -702,24 +849,31 @@ void TongaEditor::timerCallback()
     }
 
     const bool sync = proc.apvts.getRawParameterValue ("sync")->load() > 0.5f;
-    bpmSlider.setEnabled (! sync);
+    bpmSlider.setVisible (! sync);
 
-    bpmLabel.setText ("BPM aplicado: " + juce::String (proc.getAppliedBpm(), 1)
-                      + "   |   BPM original del audio: " + juce::String (proc.getOriginalBpm(), 1),
+    const bool poly = proc.apvts.getRawParameterValue ("poly")->load() > 0.5f;
+    polyButton.setButtonText (poly ? "Poly" : "Mono");
+
+    bpmLabel.setText (juce::String (proc.getAppliedBpm(), 1) + " BPM   |   original " + juce::String (proc.getOriginalBpm(), 1),
                       juce::dontSendNotification);
 
     sampleLabel.setText (proc.hasSample() ? proc.getSampleName() : juce::String ("Sin audio"),
                          juce::dontSendNotification);
 
+    playButton.playing = proc.isAuditioning();
+    playButton.repaint();
+
     const bool g = wave.isGridMode();
     gridButton.setVisible (! g);
     saveGridButton.setVisible (g);
     cancelGridButton.setVisible (g);
-    hintLabel.setText (g ? "Mueve A y B: son el inicio de 2 compases seguidos" : "",
-                       juce::dontSendNotification);
 
-    for (int i = 0; i < 4; ++i)
-        modeButtons[i].setToggleState (proc.getLastMode() == i, juce::dontSendNotification);
+    juce::String hint;
+    if (g)
+        hint = "A y B = 2 compases seguidos";
+    else if (proc.hasSample() && proc.getValidMask() == 0)
+        hint = "Pad vacio = asigna en el cursor";
+    hintLabel.setText (hint, juce::dontSendNotification);
 
     refreshPadStates();
     wave.repaint();
