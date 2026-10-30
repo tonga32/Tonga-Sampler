@@ -265,6 +265,30 @@ private:
 };
 
 //==============================================================================
+// Panel de volumenes de los stems (aparece sobre la onda cuando ya estan separados)
+class StemPanel : public juce::Component
+{
+public:
+    explicit StemPanel (juce::AudioProcessorValueTreeState& apvts);
+
+    void paint (juce::Graphics& g) override;
+    void resized() override;
+
+    std::function<void()> onRemove;
+
+private:
+    struct Knob
+    {
+        juce::Label name;
+        juce::Slider slider;
+    };
+
+    std::array<Knob, 4> knobs;
+    std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> atts;
+    juce::TextButton removeButton { "Sin stems" };
+};
+
+//==============================================================================
 class PadComp : public juce::Component
 {
 public:
@@ -344,6 +368,8 @@ private:
     juce::Slider bpmBox, keyBox, detuneBox;
     juce::Label keyLabel, detuneLabel;
     juce::TextButton syncButton { "SYNC" };
+    juce::TextButton stemsButton { "Separar stems" };
+    StemPanel stemPanel { proc.apvts };
 
     // Perillas y cajas del pad seleccionado
     std::array<Fader, 6> faders;       // 0-3 perillas, 4 velocidad, 5 tono del pad
@@ -368,6 +394,9 @@ private:
     int lastCounter = 0;
     bool updatingControls = false;
     bool needReslice = false;
+    bool stemPanelOpen = false;
+    bool hadStems = false;
+    bool wasBusy = false;
 
     std::unique_ptr<juce::FileChooser> chooser;
 

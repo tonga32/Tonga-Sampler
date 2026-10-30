@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <vector>
+#include "StemSeparator.h"
 
 // Un corte (slice) asignado a un pad, con sus ajustes propios.
 // Las posiciones estan en segundos del audio original.
@@ -21,14 +22,15 @@ struct PadSlice
     float release = 0.02f;   // segundos
 };
 
-class TongaProcessor : public juce::AudioProcessor
+class TongaProcessor : public juce::AudioProcessor,
+                       private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     static constexpr int numPads = 32;
     enum SliceMode { modeSlicer = 0, modeTransient = 1, modeSamples = 2, modeRandom = 3 };
 
     TongaProcessor();
-    ~TongaProcessor() override = default;
+    ~TongaProcessor() override;
 
     // --- AudioProcessor ---
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
@@ -88,6 +90,17 @@ public:
     void triggerPad (int pad);
     void releasePad (int pad);
 
+    // --- Stems (separacion con IA) ---
+    bool stemsSupported (juce::String& whyNot) const { return StemSeparator::isAvailable (whyNot); }
+    void startStemSeparation();
+    void cancelStemSeparation() { stemCancel.store (true); }
+    void removeStems();                         // vuelve al audio original
+    bool isStemBusy() const { return stemBusy.load(); }
+    bool hasStems() const { return stemsReady.load(); }
+    float getStemProgress() const { return stemProgress.load(); }
+    juce::String getStemMessage() const;
+    void stemThreadLoop (juce::Thread& thread); // uso interno del hilo de trabajo
+
     // Informacion para la interfaz
     std::atomic<int> lastPlayedPad { 0 };
     std::atomic<int> playCounter { 0 };
@@ -127,6 +140,10 @@ private:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
+    void parameterChanged (const juce::String& parameterID, float newValue) override;
+    void setStemMessage (const juce::String& m);
+    void doSeparate();
+    void doRebuildMix();
     void detectTempo();
     void buildTables (double sr);
     bool startVoice (int pad, int delaySamples);
@@ -175,6 +192,23 @@ private:
     std::atomic<float>* volumeParam = nullptr;
     std::atomic<float>* gkeyParam = nullptr;
     std::atomic<float>* gdetuneParam = nullptr;
+    std::atomic<float>* stemParam[4] = { nullptr, nullptr, nullptr, nullptr };
+
+    // Stems
+    std::unique_ptr<juce::Thread> stemThread;
+    mutable juce::CriticalSection stemLock;
+    StemData stems;
+    juce::String stemMessage;
+    juce::AudioBuffer<float> stemAudio;
+    double stemAudioSR = 44100.0;
+    int stemGeneration = 0;
+    std::atomic<int> sampleGeneration { 0 };
+    std::atomic<bool> stemBusy { false };
+    std::atomic<bool> stemsReady { false };
+    std::atomic<bool> stemCancel { false };
+    std::atomic<bool> separateRequested { false };
+    std::atomic<bool> mixDirty { false };
+    std::atomic<float> stemProgress { 0.0f };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaProcessor)
 };

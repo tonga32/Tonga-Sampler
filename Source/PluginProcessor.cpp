@@ -160,10 +160,27 @@ juce::AudioProcessorValueTreeState::ParameterLayout TongaProcessor::createLayout
     layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "hold", 1 }, "Mantener", false));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "volume", 1 }, "Volumen",
                                                              juce::NormalisableRange<float> (0.0f, 2.0f, 0.01f), 1.0f));
+    for (int i = 0; i < 4; ++i)
+        layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID (juce::String ("stem") + juce::String (i), 1),
+                                                                 "Stem " + juce::String (i + 1),
+                                                                 juce::NormalisableRange<float> (0.0f, 1.5f, 0.01f), 1.0f));
     layout.add (std::make_unique<juce::AudioParameterInt> (juce::ParameterID { "gkey", 1 }, "Key", -12, 12, 0));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "gdetune", 1 }, "Detune",
                                                              juce::NormalisableRange<float> (-100.0f, 100.0f, 1.0f), 0.0f));
     return layout;
+}
+
+namespace
+{
+    class StemThread : public juce::Thread
+    {
+    public:
+        explicit StemThread (TongaProcessor& p) : juce::Thread ("Tonga stems"), proc (p) {}
+        void run() override { proc.stemThreadLoop (*this); }
+
+    private:
+        TongaProcessor& proc;
+    };
 }
 
 TongaProcessor::TongaProcessor()
@@ -181,7 +198,27 @@ TongaProcessor::TongaProcessor()
     gkeyParam     = apvts.getRawParameterValue ("gkey");
     gdetuneParam  = apvts.getRawParameterValue ("gdetune");
 
+    for (int i = 0; i < 4; ++i)
+    {
+        const juce::String id = juce::String ("stem") + juce::String (i);
+        stemParam[i] = apvts.getRawParameterValue (id);
+        apvts.addParameterListener (id, this);
+    }
+
     buildTables (44100.0);
+
+    stemThread = std::make_unique<StemThread> (*this);
+    stemThread->startThread();
+}
+
+TongaProcessor::~TongaProcessor()
+{
+    stemCancel.store (true);
+    if (stemThread != nullptr)
+        stemThread->stopThread (30000);
+
+    for (int i = 0; i < 4; ++i)
+        apvts.removeParameterListener (juce::String ("stem") + juce::String (i), this);
 }
 
 void TongaProcessor::buildTables (double sr)
@@ -343,6 +380,15 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid)
         for (auto& v : voices) v.active = false;
         for (auto& sl2 : slices) sl2 = PadSlice();
         cursorSec.store (0.0);
+        sampleGeneration.fetch_add (1);
+        stemsReady.store (false);
+        stemCancel.store (true);
+    }
+
+    {
+        const juce::ScopedLock sl2 (stemLock);
+        stems = StemData();
+        stemMessage = juce::String();
     }
 
     {
@@ -944,6 +990,164 @@ void TongaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiB
         lastPlayPosSec.store (voices[(size_t) lp].anchor / fileSampleRate);
     else
         lastPlayPosSec.store (-1.0);
+}
+
+//==============================================================================
+// Stems
+//==============================================================================
+void TongaProcessor::setStemMessage (const juce::String& m)
+{
+    const juce::ScopedLock l (stemLock);
+    stemMessage = m;
+}
+
+juce::String TongaProcessor::getStemMessage() const
+{
+    const juce::ScopedLock l (stemLock);
+    return stemMessage;
+}
+
+void TongaProcessor::parameterChanged (const juce::String& parameterID, float)
+{
+    if (parameterID.startsWith ("stem"))
+    {
+        mixDirty.store (true);
+        if (stemThread != nullptr)
+            stemThread->notify();
+    }
+}
+
+void TongaProcessor::startStemSeparation()
+{
+    if (stemBusy.load() || ! hasSample())
+        return;
+
+    juce::String why;
+    if (! StemSeparator::isAvailable (why))
+    {
+        setStemMessage (why);
+        return;
+    }
+
+    stemAudio.makeCopyOf (sample);
+    stemAudioSR = fileSampleRate;
+    stemGeneration = sampleGeneration.load();
+
+    stemCancel.store (false);
+    stemProgress.store (0.0f);
+    stemBusy.store (true);
+    setStemMessage ("Separando...");
+
+    separateRequested.store (true);
+    stemThread->notify();
+}
+
+void TongaProcessor::stemThreadLoop (juce::Thread& t)
+{
+    while (! t.threadShouldExit())
+    {
+        if (separateRequested.exchange (false))
+            doSeparate();
+
+        if (mixDirty.exchange (false))
+            doRebuildMix();
+
+        t.wait (150);
+    }
+}
+
+void TongaProcessor::doSeparate()
+{
+    StemData result;
+    juce::String err;
+    const bool ok = StemSeparator::separate (stemAudio, stemAudioSR, result, stemProgress, stemCancel, err);
+    stemAudio.setSize (0, 0);
+
+    if (ok && stemGeneration == sampleGeneration.load())
+    {
+        {
+            const juce::ScopedLock l (stemLock);
+            stems = std::move (result);
+        }
+        stemsReady.store (true);
+        mixDirty.store (true);
+        setStemMessage ("Listo");
+    }
+    else if (! ok)
+    {
+        setStemMessage (err.isNotEmpty() ? err : juce::String ("No se pudo separar."));
+    }
+
+    stemProgress.store (1.0f);
+    stemBusy.store (false);
+}
+
+void TongaProcessor::doRebuildMix()
+{
+    if (! stemsReady.load())
+        return;
+
+    const int gen = sampleGeneration.load();
+    float vol[4];
+    for (int i = 0; i < 4; ++i)
+        vol[i] = stemParam[i]->load();
+
+    juce::AudioBuffer<float> mix;
+    {
+        const juce::ScopedLock l (stemLock);
+        if (stems.numStems != 4 || stems.numFrames <= 0)
+            return;
+
+        const int n = stems.numFrames;
+        mix.setSize (2, n);
+        mix.clear();
+
+        float* dl = mix.getWritePointer (0);
+        float* dr = mix.getWritePointer (1);
+        const float k = 1.0f / 32768.0f;
+
+        for (int st = 0; st < 4; ++st)
+        {
+            const float g = vol[st] * k;
+            if (g <= 0.0f)
+                continue;
+
+            const int16_t* sl = stems.data[(size_t) st * 2].data();
+            const int16_t* sr = stems.data[(size_t) st * 2 + 1].data();
+            for (int i = 0; i < n; ++i)
+            {
+                dl[i] += g * (float) sl[i];
+                dr[i] += g * (float) sr[i];
+            }
+        }
+    }
+
+    const juce::ScopedLock dl (dataLock);
+    if (gen == sampleGeneration.load() && stemsReady.load() && sample.getNumSamples() == mix.getNumSamples())
+        sample = std::move (mix);
+}
+
+void TongaProcessor::removeStems()
+{
+    if (! hasStems())
+        return;
+
+    const juce::String path = samplePath;
+    std::array<PadSlice, numPads> keep;
+    {
+        const juce::ScopedLock l (dataLock);
+        keep = slices;
+    }
+    const double cur = cursorSec.load();
+
+    if (loadFile (juce::File (path), false))
+    {
+        {
+            const juce::ScopedLock l (dataLock);
+            slices = keep;
+        }
+        cursorSec.store (cur);
+    }
 }
 
 //==============================================================================

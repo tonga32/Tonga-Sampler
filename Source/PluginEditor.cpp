@@ -482,6 +482,76 @@ void PadComp::mouseUp (const juce::MouseEvent&)
 }
 
 //==============================================================================
+// StemPanel
+//==============================================================================
+StemPanel::StemPanel (juce::AudioProcessorValueTreeState& apvts)
+{
+    // Orden en pantalla: Voz, Bateria, Bajo, Otros. El modelo los entrega: 0 bateria, 1 bajo, 2 otros, 3 voz.
+    const char* names[4] = { "Voz", "Bateria", "Bajo", "Otros" };
+    const int paramIndex[4] = { 3, 0, 1, 2 };
+
+    for (int i = 0; i < 4; ++i)
+    {
+        auto& k = knobs[(size_t) i];
+
+        k.name.setText (names[i], juce::dontSendNotification);
+        k.name.setJustificationType (juce::Justification::centred);
+        k.name.setFont (juce::Font (12.0f));
+        k.name.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+        addAndMakeVisible (k.name);
+
+        k.slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
+        k.slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                      juce::MathConstants<float>::pi * 2.75f, true);
+        k.slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 60, 16);
+        k.slider.setTextBoxIsEditable (false);
+        k.slider.setDoubleClickReturnValue (true, 1.0);
+        addAndMakeVisible (k.slider);
+
+        atts[(size_t) i] = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+            apvts, juce::String ("stem") + juce::String (paramIndex[i]), k.slider);
+
+        k.slider.textFromValueFunction = [] (double v) -> juce::String
+        {
+            return juce::String (juce::roundToInt (v * 100.0)) + "%";
+        };
+        k.slider.updateText();
+    }
+
+    addAndMakeVisible (removeButton);
+    removeButton.onClick = [this] { if (onRemove) onRemove(); };
+}
+
+void StemPanel::paint (juce::Graphics& g)
+{
+    auto b = getLocalBounds().toFloat().reduced (1.0f);
+    g.setColour (juce::Colour (0xf0121217));
+    g.fillRoundedRectangle (b, 10.0f);
+    g.setColour (yellow.withAlpha (0.55f));
+    g.drawRoundedRectangle (b, 10.0f, 1.5f);
+
+    g.setColour (juce::Colours::grey);
+    g.setFont (11.0f);
+    g.drawText ("STEMS", 14, 6, 80, 14, juce::Justification::left);
+}
+
+void StemPanel::resized()
+{
+    auto r = getLocalBounds().reduced (10, 8);
+    r.removeFromTop (12);
+    removeButton.setBounds (r.removeFromRight (84).withSizeKeepingCentre (84, 28));
+    r.removeFromRight (8);
+
+    const int w = r.getWidth() / 4;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto cell = r.removeFromLeft (w);
+        knobs[(size_t) i].name.setBounds (cell.removeFromTop (16));
+        knobs[(size_t) i].slider.setBounds (cell);
+    }
+}
+
+//==============================================================================
 // TongaEditor
 //==============================================================================
 void TongaEditor::styleIncDec (juce::Slider& s, int textW)
@@ -645,6 +715,39 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     polyToggle.drawBottom = textFn ("POLY");
     polyToggle.onChange = [this] (bool bottom) { setBoolParam (proc.apvts, "poly", bottom); };
     addAndMakeVisible (polyToggle);
+
+    addAndMakeVisible (stemsButton);
+    stemsButton.onClick = [this]
+    {
+        if (proc.isStemBusy())
+        {
+            proc.cancelStemSeparation();
+            return;
+        }
+        if (proc.hasStems())
+        {
+            stemPanelOpen = ! stemPanelOpen;
+            return;
+        }
+        if (! proc.hasSample())
+            return;
+
+        juce::String why;
+        if (! proc.stemsSupported (why))
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                    "Stems no disponibles", why);
+            return;
+        }
+        proc.startStemSeparation();
+    };
+
+    addChildComponent (stemPanel);
+    stemPanel.onRemove = [this]
+    {
+        proc.removeStems();
+        stemPanelOpen = false;
+    };
 
     styleIncDec (bpmBox, 56);
     bpmAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "bpm", bpmBox);
@@ -880,6 +983,8 @@ void TongaEditor::resized()
         holdToggle.setBounds (cr.removeFromLeft (46));
         cr.removeFromLeft (8);
         polyToggle.setBounds (cr.removeFromLeft (58));
+        cr.removeFromLeft (14);
+        stemsButton.setBounds (cr.removeFromLeft (132).reduced (0, 8));
 
         auto kd = cr.removeFromRight (200);
         auto row1 = kd.removeFromTop (22);
@@ -907,6 +1012,7 @@ void TongaEditor::resized()
     auto knobRow = r.removeFromBottom (108);
     r.removeFromBottom (8);
     wave.setBounds (r);
+    stemPanel.setBounds (r.getRight() - 478, r.getY() + 8, 470, 132);
 
     // Perillas
     knobPanel = knobRow;
@@ -1179,6 +1285,39 @@ void TongaEditor::timerCallback()
         divLabel.setText (divisionNames[di], juce::dontSendNotification);
     }
 
+    // Stems: boton, panel y avisos
+    {
+        const bool busy = proc.isStemBusy();
+        const bool has = proc.hasStems();
+
+        if (busy)
+            stemsButton.setButtonText ("Cancelar " + juce::String (juce::roundToInt (proc.getStemProgress() * 100.0f)) + "%");
+        else if (has)
+            stemsButton.setButtonText ("Stems");
+        else
+            stemsButton.setButtonText ("Separar stems");
+
+        if (has && ! hadStems)
+            stemPanelOpen = true;
+        hadStems = has;
+
+        stemsButton.setToggleState (has && stemPanelOpen, juce::dontSendNotification);
+        const bool showPanel = has && stemPanelOpen;
+        if (showPanel && ! stemPanel.isVisible())
+            stemPanel.toFront (false);
+        stemPanel.setVisible (showPanel);
+
+        // Si termino sin stems (error o cancelado), avisar una sola vez
+        if (wasBusy && ! busy && ! has)
+        {
+            const juce::String msg = proc.getStemMessage();
+            if (msg.isNotEmpty() && msg != "Cancelado")
+                juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                        "No se pudieron separar los stems", msg);
+        }
+        wasBusy = busy;
+    }
+
     // Textos
     bpmLabel.setText ("BPM " + juce::String (proc.getAppliedBpm(), 1)
                       + "   (orig " + juce::String (proc.getOriginalBpm(), 1) + ")",
@@ -1202,6 +1341,8 @@ void TongaEditor::timerCallback()
     juce::String hint;
     if (g)
         hint = "A y B = inicio de 2 compases seguidos";
+    else if (proc.isStemBusy())
+        hint = "Separando stems... puede tardar unos minutos";
     else if (proc.hasSample() && lm < 0 && proc.getValidMask() == 0)
         hint = "Click en la onda = cursor. Pad vacio = se asigna ahi";
     hintLabel.setText (hint, juce::dontSendNotification);
