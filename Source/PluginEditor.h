@@ -226,7 +226,7 @@ public:
     void commitGrid();
 
 private:
-    enum DragKind { dragNone, dragScroll, dragGridA, dragGridB, dragPadStart, dragPadEnd };
+    enum DragKind { dragNone, dragScroll, dragGridA, dragGridB, dragPadStart, dragPadStretch, dragPadEnd };
 
     double xToSec (float x) const;
     float secToX (double s) const;
@@ -243,6 +243,7 @@ private:
     double dragStartView = 0.0;
 
     std::vector<float> mins, maxs;
+    std::vector<juce::Colour> colours;
 };
 
 // Franja con todo el audio y un recuadro de la zona que se ve abajo
@@ -260,16 +261,17 @@ private:
 
     TongaProcessor& proc;
     WaveView& wave;
-    juce::String cacheKey;
     std::vector<float> mins, maxs;
+    std::vector<juce::Colour> colours;
 };
 
 //==============================================================================
-// Panel de volumenes de los stems (aparece sobre la onda cuando ya estan separados)
-class StemPanel : public juce::Component
+// Panel de los stems: un boton para silenciar y una perilla de volumen por stem
+class StemPanel : public juce::Component, private juce::Timer
 {
 public:
     explicit StemPanel (juce::AudioProcessorValueTreeState& apvts);
+    ~StemPanel() override { stopTimer(); }
 
     void paint (juce::Graphics& g) override;
     void resized() override;
@@ -279,13 +281,27 @@ public:
 private:
     struct Knob
     {
-        juce::Label name;
+        juce::TextButton name;
         juce::Slider slider;
+        float lastVol = 1.0f;
     };
 
+    void timerCallback() override;
+    void toggleMute (int i);
+
+    juce::AudioProcessorValueTreeState& state;
+    int paramIndex[4] = { 3, 0, 1, 2 };
     std::array<Knob, 4> knobs;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> atts;
     juce::TextButton removeButton { "Sin stems" };
+};
+
+// Contenedor de toda la interfaz: se dibuja a 960x720 y se escala entero (100%, 85%, 75%)
+class ScaledRoot : public juce::Component
+{
+public:
+    std::function<void (juce::Graphics&)> onPaint;
+    void paint (juce::Graphics& g) override { if (onPaint) onPaint (g); }
 };
 
 //==============================================================================
@@ -344,9 +360,11 @@ private:
     void scaleOriginalBpm (double factor);
     void stepDivision (int delta);
     void shiftSlicer (int dir);
+    void applyScale (float s);
 
     TongaLook look;
     TongaProcessor& proc;
+    ScaledRoot root;
 
     WaveView wave;
     OverviewView overview;
@@ -355,6 +373,7 @@ private:
     juce::ImageComponent logo;
     juce::Label title;
     juce::TextButton loadButton { "Cargar audio" };
+    juce::TextButton scaleButton { "100%" };
 
     // Franja de informacion
     juce::Rectangle<int> infoStrip, knobPanel;

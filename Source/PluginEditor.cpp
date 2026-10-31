@@ -144,8 +144,9 @@ void WaveView::paint (juce::Graphics& g)
     const int w = getWidth();
     const int h = getHeight();
     const float mid = (float) h * 0.5f;
+    const double dur = proc.getLengthSec();
 
-    // Bandas de los pads asignados (cada uno con su color)
+    // Pads asignados: cada uno con su color. Los que suenan hasta el final solo muestran la linea de inicio.
     for (int i = 0; i < TongaProcessor::numPads; ++i)
     {
         const auto s = proc.getSlice (i);
@@ -153,28 +154,32 @@ void WaveView::paint (juce::Graphics& g)
             continue;
 
         const float x0 = secToX (s.start);
-        const float x1 = secToX (s.end);
+        const float x1 = secToX (s.toEnd ? dur : s.end);
         if (x1 < 0.0f || x0 > (float) w)
             continue;
 
-        g.setColour (padColour (i).withAlpha (i == selectedPad ? 0.30f : 0.12f));
+        const bool sel = (i == selectedPad);
+        const float alpha = s.toEnd ? (sel ? 0.10f : 0.04f) : (sel ? 0.30f : 0.12f);
+        g.setColour (padColour (i).withAlpha (alpha));
         g.fillRect (x0, 0.0f, juce::jmax (1.0f, x1 - x0), (float) h);
 
         g.setColour (padColour (i));
-        g.fillRect (x0, 0.0f, 1.0f, (float) h);
+        g.fillRect (x0, 0.0f, 1.0f, (float) h);                       // linea de inicio
+        if (! s.toEnd)
+            g.fillRect (x1 - 1.0f, 0.0f, 1.0f, (float) h);            // linea de fin (solo si se corto)
         g.setFont (11.0f);
         g.drawText (juce::String (i + 1), (int) x0 + 4, 3, 24, 13, juce::Justification::left);
     }
 
-    // Onda
-    proc.getPeaks (viewStart, viewLen, w, mins, maxs);
-    g.setColour (juce::Colour (0xffe8e8ef));
+    // Onda con colores por frecuencia: graves rosa-rojo, medios amarillo, agudos celeste
+    proc.getPeaks (viewStart, viewLen, w, mins, maxs, colours);
     for (int x = 0; x < w; ++x)
     {
         const float mn = mins[(size_t) x];
         const float mx = maxs[(size_t) x];
         const float top = mid - mx * mid * 0.92f;
         const float hh = juce::jmax (1.0f, (mx - mn) * mid * 0.92f);
+        g.setColour (colours[(size_t) x]);
         g.fillRect ((float) x, top, 1.0f, hh);
     }
 
@@ -235,19 +240,28 @@ void WaveView::paint (juce::Graphics& g)
     }
     else
     {
-        // Marcas de inicio y fin del pad seleccionado (se arrastran)
+        // Marcas del pad seleccionado
         const auto s = proc.getSlice (selectedPad);
         if (s.valid)
         {
             const float xs = secToX (s.start);
-            const float xe = secToX (s.end);
             g.setColour (padColour (selectedPad));
             g.fillRect (xs - 1.0f, 0.0f, 2.0f, (float) h);
-            g.fillRect (xe - 1.0f, 0.0f, 2.0f, (float) h);
 
             juce::Path tri;
-            tri.addTriangle (xs, 0.0f, xs + 12.0f, 0.0f, xs, 12.0f);
-            tri.addTriangle (xe, 0.0f, xe - 12.0f, 0.0f, xe, 12.0f);
+            tri.addTriangle (xs, 0.0f, xs + 12.0f, 0.0f, xs, 12.0f);   // mover el inicio
+
+            if (! s.toEnd)
+            {
+                const float xe = secToX (s.end);
+                g.fillRect (xe - 1.0f, 0.0f, 2.0f, (float) h);
+                tri.addTriangle (xe, 0.0f, xe - 12.0f, 0.0f, xe, 12.0f);   // mover el fin
+            }
+            else
+            {
+                // Flechita para estirar hacia la derecha y darle un fin al sample
+                tri.addTriangle (xs + 4.0f, mid - 8.0f, xs + 4.0f, mid + 8.0f, xs + 16.0f, mid);
+            }
             g.fillPath (tri);
         }
     }
@@ -292,8 +306,21 @@ void WaveView::mouseDown (const juce::MouseEvent& e)
         const auto s = proc.getSlice (selectedPad);
         if (s.valid)
         {
-            if (std::abs (x - secToX (s.start)) < 8.0f)      drag = dragPadStart;
-            else if (std::abs (x - secToX (s.end)) < 8.0f)   drag = dragPadEnd;
+            const float xs = secToX (s.start);
+            if (std::abs (x - xs) < 8.0f)
+            {
+                // Arriba (triangulo) mueve el inicio. En un pad que suena hasta el final,
+                // el resto de la linea sirve para estirar y cortarlo.
+                drag = (s.toEnd && e.y >= 16) ? dragPadStretch : dragPadStart;
+            }
+            else if (s.toEnd && x > xs && x < xs + 22.0f && std::abs ((float) e.y - (float) getHeight() * 0.5f) < 14.0f)
+            {
+                drag = dragPadStretch;
+            }
+            else if (! s.toEnd && std::abs (x - secToX (s.end)) < 8.0f)
+            {
+                drag = dragPadEnd;
+            }
         }
     }
 }
@@ -329,15 +356,38 @@ void WaveView::mouseDrag (const juce::MouseEvent& e)
         case dragPadStart:
         {
             auto s = proc.getSlice (selectedPad);
-            s.start = juce::jlimit (0.0, s.end - 0.002, t);
+            const double maxStart = s.toEnd ? juce::jmax (0.0, dur - 0.02) : s.end - 0.002;
+            s.start = juce::jlimit (0.0, maxStart, t);
             proc.setSlice (selectedPad, s);
+            break;
+        }
+
+        case dragPadStretch:
+        {
+            auto s = proc.getSlice (selectedPad);
+            if (t > s.start + 0.01)
+            {
+                s.end = t;
+                s.toEnd = false;               // ahora tiene un fin: aparece su linea
+                proc.setSlice (selectedPad, s);
+                drag = dragPadEnd;             // se sigue arrastrando como marca de fin
+            }
             break;
         }
 
         case dragPadEnd:
         {
             auto s = proc.getSlice (selectedPad);
-            s.end = juce::jlimit (s.start + 0.002, dur, t);
+            if (t >= dur - 0.02)
+            {
+                s.end = dur;
+                s.toEnd = true;                // llevado hasta el final: vuelve a sonar hasta el final
+            }
+            else
+            {
+                s.end = juce::jlimit (s.start + 0.002, dur, t);
+                s.toEnd = false;
+            }
             proc.setSlice (selectedPad, s);
             break;
         }
@@ -389,19 +439,14 @@ void OverviewView::paint (juce::Graphics& g)
     const int h = getHeight();
     const double dur = proc.getLengthSec();
 
-    const juce::String key = proc.getSampleName() + "|" + juce::String (dur, 3) + "|" + juce::String (w);
-    if (key != cacheKey)
-    {
-        proc.getPeaks (0.0, dur, w, mins, maxs);
-        cacheKey = key;
-    }
+    proc.getPeaks (0.0, dur, w, mins, maxs, colours);
 
     const float mid = (float) h * 0.5f - 2.0f;
-    g.setColour (juce::Colour (0xff8a8a96));
     for (int x = 0; x < w && x < (int) mins.size(); ++x)
     {
         const float top = mid - maxs[(size_t) x] * mid;
         const float hh = juce::jmax (1.0f, (maxs[(size_t) x] - mins[(size_t) x]) * mid);
+        g.setColour (colours[(size_t) x]);
         g.fillRect ((float) x, top, 1.0f, hh);
     }
 
@@ -412,7 +457,7 @@ void OverviewView::paint (juce::Graphics& g)
         if (! s.valid)
             continue;
         const float x0 = (float) (s.start / dur * (double) w);
-        const float x1 = (float) (s.end / dur * (double) w);
+        const float x1 = (float) ((s.toEnd ? dur : s.end) / dur * (double) w);
         g.setColour (padColour (i));
         g.fillRect (x0, (float) h - 4.0f, juce::jmax (1.5f, x1 - x0), 3.0f);
     }
@@ -484,20 +529,19 @@ void PadComp::mouseUp (const juce::MouseEvent&)
 //==============================================================================
 // StemPanel
 //==============================================================================
-StemPanel::StemPanel (juce::AudioProcessorValueTreeState& apvts)
+StemPanel::StemPanel (juce::AudioProcessorValueTreeState& apvts) : state (apvts)
 {
     // Orden en pantalla: Voz, Bateria, Bajo, Otros. El modelo los entrega: 0 bateria, 1 bajo, 2 otros, 3 voz.
     const char* names[4] = { "Voz", "Bateria", "Bajo", "Otros" };
-    const int paramIndex[4] = { 3, 0, 1, 2 };
 
     for (int i = 0; i < 4; ++i)
     {
         auto& k = knobs[(size_t) i];
 
-        k.name.setText (names[i], juce::dontSendNotification);
-        k.name.setJustificationType (juce::Justification::centred);
-        k.name.setFont (juce::Font (12.0f));
-        k.name.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+        k.name.setButtonText (names[i]);
+        k.name.setClickingTogglesState (false);
+        k.name.setToggleState (true, juce::dontSendNotification);   // encendido = suena
+        k.name.onClick = [this, i] { toggleMute (i); };
         addAndMakeVisible (k.name);
 
         k.slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
@@ -520,6 +564,39 @@ StemPanel::StemPanel (juce::AudioProcessorValueTreeState& apvts)
 
     addAndMakeVisible (removeButton);
     removeButton.onClick = [this] { if (onRemove) onRemove(); };
+
+    startTimerHz (12);
+}
+
+void StemPanel::toggleMute (int i)
+{
+    const juce::String id = juce::String ("stem") + juce::String (paramIndex[i]);
+    auto* p = state.getParameter (id);
+    if (p == nullptr)
+        return;
+
+    auto& k = knobs[(size_t) i];
+    const float cur = state.getRawParameterValue (id)->load();
+    float target = 0.0f;
+    if (cur > 0.001f)
+        k.lastVol = cur;                                           // silenciar: se acuerda del volumen
+    else
+        target = k.lastVol > 0.001f ? k.lastVol : 1.0f;            // volver a sonar
+
+    p->beginChangeGesture();
+    p->setValueNotifyingHost (p->convertTo0to1 (target));
+    p->endChangeGesture();
+}
+
+void StemPanel::timerCallback()
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        const juce::String id = juce::String ("stem") + juce::String (paramIndex[i]);
+        const bool on = state.getRawParameterValue (id)->load() > 0.001f;
+        if (knobs[(size_t) i].name.getToggleState() != on)
+            knobs[(size_t) i].name.setToggleState (on, juce::dontSendNotification);
+    }
 }
 
 void StemPanel::paint (juce::Graphics& g)
@@ -538,15 +615,16 @@ void StemPanel::paint (juce::Graphics& g)
 void StemPanel::resized()
 {
     auto r = getLocalBounds().reduced (10, 8);
-    r.removeFromTop (12);
+    r.removeFromTop (14);
     removeButton.setBounds (r.removeFromRight (84).withSizeKeepingCentre (84, 28));
     r.removeFromRight (8);
 
     const int w = r.getWidth() / 4;
     for (int i = 0; i < 4; ++i)
     {
-        auto cell = r.removeFromLeft (w);
-        knobs[(size_t) i].name.setBounds (cell.removeFromTop (16));
+        auto cell = r.removeFromLeft (w).reduced (4, 0);
+        knobs[(size_t) i].name.setBounds (cell.removeFromTop (22));
+        cell.removeFromTop (2);
         knobs[(size_t) i].slider.setBounds (cell);
     }
 }
@@ -561,7 +639,7 @@ void TongaEditor::styleIncDec (juce::Slider& s, int textW)
     s.setTextBoxStyle (juce::Slider::TextBoxLeft, false, textW, 22);
     s.setColour (juce::Slider::textBoxBackgroundColourId, TongaColours::inset);
     s.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white);
-    addAndMakeVisible (s);
+    root.addAndMakeVisible (s);
 }
 
 void TongaEditor::setupFader (int i, const juce::String& label, bool knob, double mn, double mx, double step, double def,
@@ -575,7 +653,7 @@ void TongaEditor::setupFader (int i, const juce::String& label, bool knob, doubl
     f.name.setJustificationType (juce::Justification::centred);
     f.name.setFont (juce::Font (12.0f));
     f.name.setColour (juce::Label::textColourId, juce::Colours::grey);
-    addAndMakeVisible (f.name);
+    root.addAndMakeVisible (f.name);
 
     if (knob)
     {
@@ -584,7 +662,7 @@ void TongaEditor::setupFader (int i, const juce::String& label, bool knob, doubl
                                       juce::MathConstants<float>::pi * 2.75f, true);
         f.slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 16);
         f.slider.setTextBoxIsEditable (false);
-        addAndMakeVisible (f.slider);
+        root.addAndMakeVisible (f.slider);
     }
     else
     {
@@ -617,23 +695,32 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     : AudioProcessorEditor (&p), proc (p), wave (p), overview (p, wave)
 {
     setLookAndFeel (&look);
-    setSize (960, 720);
 
-    addAndMakeVisible (wave);
-    addAndMakeVisible (overview);
+    root.setBounds (0, 0, 960, 720);
+    root.onPaint = [this] (juce::Graphics& g)
+    {
+        g.setColour (TongaColours::inset);
+        g.fillRoundedRectangle (infoStrip.toFloat(), 8.0f);
+        g.setColour (TongaColours::panel);
+        g.fillRoundedRectangle (knobPanel.toFloat(), 8.0f);
+    };
+    addAndMakeVisible (root);
+
+    root.addAndMakeVisible (wave);
+    root.addAndMakeVisible (overview);
 
     // --- Encabezado ---
     logo.setImage (juce::ImageCache::getFromMemory (BinaryData::TONGA_SAMPLER_png,
                                                     BinaryData::TONGA_SAMPLER_pngSize));
     logo.setImagePlacement (juce::RectanglePlacement::centred);
-    addAndMakeVisible (logo);
+    root.addAndMakeVisible (logo);
 
     title.setText ("Tonga Sampler 2", juce::dontSendNotification);
     title.setFont (juce::Font (20.0f, juce::Font::bold));
     title.setColour (juce::Label::textColourId, yellow);
-    addAndMakeVisible (title);
+    root.addAndMakeVisible (title);
 
-    addAndMakeVisible (loadButton);
+    root.addAndMakeVisible (loadButton);
     loadButton.onClick = [this]
     {
         chooser = std::make_unique<juce::FileChooser> ("Elegi un audio", juce::File(),
@@ -647,17 +734,24 @@ TongaEditor::TongaEditor (TongaProcessor& p)
                               });
     };
 
+    root.addAndMakeVisible (scaleButton);
+    scaleButton.onClick = [this]
+    {
+        const float cur = proc.uiScale.load();
+        applyScale (cur > 0.95f ? 0.85f : (cur > 0.8f ? 0.75f : 1.0f));
+    };
+
     // --- Franja de informacion ---
     sampleLabel.setFont (juce::Font (15.0f));
     sampleLabel.setColour (juce::Label::textColourId, juce::Colours::white);
-    addAndMakeVisible (sampleLabel);
+    root.addAndMakeVisible (sampleLabel);
 
     bpmLabel.setJustificationType (juce::Justification::centredRight);
     bpmLabel.setColour (juce::Label::textColourId, yellow);
-    addAndMakeVisible (bpmLabel);
+    root.addAndMakeVisible (bpmLabel);
 
-    addAndMakeVisible (bpmHalf);
-    addAndMakeVisible (bpmDouble);
+    root.addAndMakeVisible (bpmHalf);
+    root.addAndMakeVisible (bpmDouble);
     bpmHalf.onClick = [this] { scaleOriginalBpm (0.5); };
     bpmDouble.onClick = [this] { scaleOriginalBpm (2.0); };
 
@@ -665,18 +759,18 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     sigCaption.setFont (juce::Font (11.0f));
     sigCaption.setJustificationType (juce::Justification::centredRight);
     sigCaption.setColour (juce::Label::textColourId, juce::Colours::grey);
-    addAndMakeVisible (sigCaption);
+    root.addAndMakeVisible (sigCaption);
 
     timeSigBox.addItemList (juce::StringArray { "2/4", "3/4", "4/4", "6/8", "9/8", "12/8" }, 1);
-    addAndMakeVisible (timeSigBox);
+    root.addAndMakeVisible (timeSigBox);
     sigAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "timesig", timeSigBox);
 
     timeLabel.setJustificationType (juce::Justification::centredRight);
     timeLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-    addAndMakeVisible (timeLabel);
+    root.addAndMakeVisible (timeLabel);
 
     // --- Fila de control ---
-    addAndMakeVisible (playButton);
+    root.addAndMakeVisible (playButton);
     playButton.onClick = [this] { proc.toggleAudition(); };
 
     // Mantener (arriba) / Una vez hasta el final (abajo)
@@ -700,7 +794,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
         g.fillPath (tri);
     };
     holdToggle.onChange = [this] (bool bottom) { setBoolParam (proc.apvts, "hold", ! bottom); };
-    addAndMakeVisible (holdToggle);
+    root.addAndMakeVisible (holdToggle);
 
     auto textFn = [] (const juce::String& t)
     {
@@ -714,9 +808,9 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     polyToggle.drawTop = textFn ("MONO");
     polyToggle.drawBottom = textFn ("POLY");
     polyToggle.onChange = [this] (bool bottom) { setBoolParam (proc.apvts, "poly", bottom); };
-    addAndMakeVisible (polyToggle);
+    root.addAndMakeVisible (polyToggle);
 
-    addAndMakeVisible (stemsButton);
+    root.addAndMakeVisible (stemsButton);
     stemsButton.onClick = [this]
     {
         if (proc.isStemBusy())
@@ -742,7 +836,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
         proc.startStemSeparation();
     };
 
-    addChildComponent (stemPanel);
+    root.addChildComponent (stemPanel);
     stemPanel.onRemove = [this]
     {
         proc.removeStems();
@@ -752,7 +846,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     styleIncDec (bpmBox, 56);
     bpmAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "bpm", bpmBox);
 
-    addAndMakeVisible (syncButton);
+    root.addAndMakeVisible (syncButton);
     syncAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "sync", syncButton);
 
     keyLabel.setText ("KEY", juce::dontSendNotification);
@@ -761,7 +855,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     {
         l->setFont (juce::Font (11.0f, juce::Font::bold));
         l->setColour (juce::Label::textColourId, yellow);
-        addAndMakeVisible (*l);
+        root.addAndMakeVisible (*l);
     }
 
     styleIncDec (keyBox, 54);
@@ -832,8 +926,8 @@ TongaEditor::TongaEditor (TongaProcessor& p)
                 [] (PadSlice& s, float v) { s.keyShift = juce::roundToInt (v); },
                 [] (const PadSlice& s) { return (float) s.keyShift; });
 
-    addAndMakeVisible (stretchHalf);
-    addAndMakeVisible (stretchDouble);
+    root.addAndMakeVisible (stretchHalf);
+    root.addAndMakeVisible (stretchDouble);
     stretchHalf.onClick = [this] { scaleStretch (0.5); };
     stretchDouble.onClick = [this] { scaleStretch (2.0); };
 
@@ -844,7 +938,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
         const bool r = reverseButton.getToggleState();
         applyToSelected ([r] (PadSlice& s) { s.reverse = r; });
     };
-    addAndMakeVisible (reverseButton);
+    root.addAndMakeVisible (reverseButton);
 
     // --- Fila de abajo: modo de corte ---
     modeBox.addItem ("Set Slicer", 1);
@@ -858,10 +952,10 @@ TongaEditor::TongaEditor (TongaProcessor& p)
         if (id >= 1 && id <= 4)
             doSlicing (modeOfId[id]);
     };
-    addAndMakeVisible (modeBox);
+    root.addAndMakeVisible (modeBox);
 
     for (auto* b : { &pageLeft, &pageRight, &divDec, &divInc })
-        addChildComponent (*b);
+        root.addChildComponent (*b);
     pageLeft.onClick = [this] { shiftSlicer (-1); };
     pageRight.onClick = [this] { shiftSlicer (1); };
     divDec.onClick = [this] { stepDivision (-1); };
@@ -870,13 +964,13 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     divLabel.setJustificationType (juce::Justification::centred);
     divLabel.setFont (juce::Font (15.0f, juce::Font::bold));
     divLabel.setColour (juce::Label::textColourId, yellow);
-    addChildComponent (divLabel);
+    root.addChildComponent (divLabel);
 
-    addChildComponent (rerollButton);
+    root.addChildComponent (rerollButton);
     rerollButton.onClick = [this] { doSlicing (TongaProcessor::modeRandom); };
 
-    addAndMakeVisible (selectAllButton);
-    addAndMakeVisible (clearButton);
+    root.addAndMakeVisible (selectAllButton);
+    root.addAndMakeVisible (clearButton);
     selectAllButton.onClick = [this]
     {
         if (selMask == 0xFFFFFFFFu)
@@ -897,11 +991,11 @@ TongaEditor::TongaEditor (TongaProcessor& p)
 
     hintLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
     hintLabel.setFont (juce::Font (12.0f));
-    addAndMakeVisible (hintLabel);
+    root.addAndMakeVisible (hintLabel);
 
-    addAndMakeVisible (gridButton);
-    addChildComponent (saveGridButton);
-    addChildComponent (cancelGridButton);
+    root.addAndMakeVisible (gridButton);
+    root.addChildComponent (saveGridButton);
+    root.addChildComponent (cancelGridButton);
     gridButton.onClick = [this] { wave.setGridMode (true); };
     saveGridButton.onClick = [this] { wave.commitGrid(); syncPadControls(); };
     cancelGridButton.onClick = [this] { wave.setGridMode (false); };
@@ -912,7 +1006,7 @@ TongaEditor::TongaEditor (TongaProcessor& p)
         pads[i].index = i;
         pads[i].onDown = [this] (int pad, const juce::ModifierKeys& m) { padClicked (pad, m); };
         pads[i].onUp = [this] (int pad) { proc.releasePad (pad); };
-        addAndMakeVisible (pads[i]);
+        root.addAndMakeVisible (pads[i]);
     }
 
     if (proc.hasSample())
@@ -922,7 +1016,17 @@ TongaEditor::TongaEditor (TongaProcessor& p)
     wave.setSelectedPad (curPad);
     syncPadControls();
     refreshPadStates();
+    applyScale (proc.uiScale.load());
     startTimerHz (30);
+}
+
+void TongaEditor::applyScale (float sc)
+{
+    sc = juce::jlimit (0.5f, 1.0f, sc);
+    proc.uiScale.store (sc);
+    root.setTransform (juce::AffineTransform::scale (sc));
+    setSize (juce::roundToInt (960.0f * sc), juce::roundToInt (720.0f * sc));
+    scaleButton.setButtonText (juce::String (juce::roundToInt (sc * 100.0f)) + "%");
 }
 
 TongaEditor::~TongaEditor()
@@ -934,21 +1038,17 @@ TongaEditor::~TongaEditor()
 void TongaEditor::paint (juce::Graphics& g)
 {
     g.fillAll (bgDark);
-
-    g.setColour (TongaColours::inset);
-    g.fillRoundedRectangle (infoStrip.toFloat(), 8.0f);
-
-    g.setColour (TongaColours::panel);
-    g.fillRoundedRectangle (knobPanel.toFloat(), 8.0f);
 }
 
 void TongaEditor::resized()
 {
-    auto r = getLocalBounds().reduced (12);
+    auto r = root.getLocalBounds().reduced (12);
 
     // Encabezado: marca al centro, cargar audio a la derecha
     auto top = r.removeFromTop (36);
     loadButton.setBounds (top.removeFromRight (110).reduced (0, 4));
+    top.removeFromRight (6);
+    scaleButton.setBounds (top.removeFromRight (56).reduced (0, 4));
     {
         auto c = top.withSizeKeepingCentre (36 + 8 + 190, 36);
         logo.setBounds (c.removeFromLeft (36));
@@ -1351,6 +1451,12 @@ void TongaEditor::timerCallback()
         hint = proc.getStemMessage();
     else if (proc.hasSample() && lm < 0 && proc.getValidMask() == 0)
         hint = "Click en la onda = cursor. Pad vacio = se asigna ahi";
+    if (hint.isEmpty() && proc.hasSample())
+    {
+        const auto cur = proc.getSlice (curPad);
+        if (cur.valid && cur.toEnd)
+            hint = "Estira la linea hacia la derecha para cortarlo";
+    }
     hintLabel.setText (hint, juce::dontSendNotification);
 
     refreshPadStates();

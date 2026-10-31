@@ -1,5 +1,6 @@
 #include "StemSeparator.h"
 #include "onnxruntime_c_api.h"
+#include <map>
 
 namespace
 {
@@ -31,18 +32,6 @@ namespace
         v = juce::jlimit (-1.0f, 1.0f, v);
         return (int16_t) juce::roundToInt (v * 32767.0f);
     }
-
-    std::vector<float> resampleChannel (const float* in, int inLen, double speedRatio, int outLen)
-    {
-        std::vector<float> padded ((size_t) inLen + 64, 0.0f);
-        std::copy (in, in + inLen, padded.begin());
-
-        std::vector<float> out ((size_t) juce::jmax (0, outLen), 0.0f);
-        juce::LagrangeInterpolator li;
-        li.process (speedRatio, padded.data(), out.data(), outLen);
-        return out;
-    }
-
 
     // ---- Archivo de stems guardado (cache) ----
     constexpr int kCacheMagic = 0x4D545354;   // "TSTM"
@@ -127,13 +116,10 @@ namespace
         if (asize != audio.getSize() || amod != audio.getLastModificationTime().toMilliseconds())
             return false;
 
-        out.numStems = ns;
-        out.numFrames = nf;
-        out.data.assign ((size_t) ns * 2, std::vector<int16_t>());
+        out.init (ns, nf, true);
 
         for (auto& v : out.data)
         {
-            v.resize ((size_t) nf);
             const size_t bytes = (size_t) nf * sizeof (int16_t);
             if ((size_t) is.read (v.data(), (int) bytes) != bytes)
             {
@@ -239,8 +225,9 @@ bool StemSeparator::loadCache (const juce::File& audio, double sampleRate, int e
 }
 
 //==============================================================================
-bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audioSR, StemData& out,
-                              std::atomic<float>& progress, std::atomic<bool>& cancel, juce::String& error)
+bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audioSR, StemData& out, int startFrame,
+                              std::atomic<float>& progress, std::atomic<bool>& cancel,
+                              const std::function<void()>& onChunkDone, juce::String& error)
 {
     juce::String why;
     if (! isAvailable (why))
@@ -257,6 +244,16 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
     if (srcN < 2000 || chs < 1)
     {
         error = "El audio es demasiado corto para separar.";
+        return false;
+    }
+    if (std::abs (audioSR - kModelRate) > 0.5)
+    {
+        error = "Para separar stems el audio tiene que estar a 44.1 kHz.";
+        return false;
+    }
+    if (out.numFrames != srcN || out.numStems < 1 || out.done == nullptr)
+    {
+        error = "Los stems no estan preparados.";
         return false;
     }
 
@@ -295,14 +292,15 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
         return false;
     };
 
-    // --- 2) Sesion con el modelo ---
+    // --- 2) Sesion con el modelo (usa todos los nucleos fisicos) ---
     if (! ok (api->CreateEnv (ORT_LOGGING_LEVEL_WARNING, "tonga", &h.env)))
         return false;
     if (! ok (api->CreateSessionOptions (&h.opts)))
         return false;
 
-    const int threads = juce::jmax (1, juce::SystemStats::getNumPhysicalCpus() - 1);
+    const int threads = juce::jmax (1, juce::SystemStats::getNumPhysicalCpus());
     ok (api->SetIntraOpNumThreads (h.opts, threads));
+    ok (api->SetInterOpNumThreads (h.opts, 1));
     ok (api->SetSessionGraphOptimizationLevel (h.opts, ORT_ENABLE_ALL));
 
     progress.store (0.01f);
@@ -327,33 +325,7 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
     api->AllocatorFree (alloc, inRaw);
     api->AllocatorFree (alloc, outRaw);
 
-    // --- 3) Audio a 44.1 kHz estereo ---
-    const bool needResample = std::abs (audioSR - kModelRate) > 0.5;
-    const double ratioIn = audioSR / kModelRate;
-    const int len44 = needResample ? (int) std::floor ((double) srcN / ratioIn) : srcN;
-
-    std::vector<float> srcL, srcR;
-    if (needResample)
-    {
-        srcL = resampleChannel (audio.getReadPointer (0), srcN, ratioIn, len44);
-        srcR = (chs > 1) ? resampleChannel (audio.getReadPointer (1), srcN, ratioIn, len44) : srcL;
-    }
-    else
-    {
-        srcL.assign (audio.getReadPointer (0), audio.getReadPointer (0) + srcN);
-        if (chs > 1)
-            srcR.assign (audio.getReadPointer (1), audio.getReadPointer (1) + srcN);
-        else
-            srcR = srcL;
-    }
-
-    if (cancel.load())
-    {
-        error = "Cancelado";
-        return false;
-    }
-
-    // --- 4) Tensor de entrada reutilizable ---
+    // --- 3) Tensor de entrada reutilizable ---
     std::vector<float> inBuf ((size_t) 2 * kSegment, 0.0f);
     const int64_t shape[3] = { 1, 2, kSegment };
     if (! ok (api->CreateCpuMemoryInfo (OrtArenaAllocator, OrtMemTypeDefault, &h.mem)))
@@ -362,8 +334,11 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
                                                    shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &h.input)))
         return false;
 
-    // Pesos triangulares para mezclar los tramos que se pisan
-    const int overlapLen = kSegment / 4;
+    const float* srcL = audio.getReadPointer (0);
+    const float* srcR = chs > 1 ? audio.getReadPointer (1) : srcL;
+
+    // Tramos: se pisan un poco (1/8) y se mezclan con pesos triangulares
+    const int overlapLen = kSegment / 8;
     const int stride = kSegment - overlapLen;
     const int half = kSegment / 2;
     std::vector<float> weight ((size_t) kSegment);
@@ -371,15 +346,25 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
         weight[(size_t) i] = (i < half) ? (float) (i + 1) / (float) half
                                         : (float) (kSegment - i) / (float) half;
 
-    std::vector<float> acc, wacc ((size_t) kSegment, 0.0f);
-    int nStems = 0;
+    const int totalChunks = 1 + (srcN > kSegment ? (int) std::ceil ((double) (srcN - kSegment) / (double) stride) : 0);
 
-    const int totalChunks = 1 + (len44 > kSegment ? (int) std::ceil ((double) (len44 - kSegment) / (double) stride) : 0);
+    // Orden: empieza en el tramo del cursor, sigue hacia adelante y despues vuelve hacia atras
+    const int firstChunk = juce::jlimit (0, totalChunks - 1, startFrame / stride);
+    std::vector<int> order;
+    for (int k = firstChunk; k < totalChunks; ++k)
+        order.push_back (k);
+    for (int k = firstChunk - 1; k >= 0; --k)
+        order.push_back (k);
+
     const char* inNames[1] = { inputName.toRawUTF8() };
     const char* outNames[1] = { outputName.toRawUTF8() };
 
-    int pos = 0;
-    for (int chunk = 0;; ++chunk)
+    const int nStems = out.numStems;
+    const int nCh = nStems * 2;
+    std::map<int, std::vector<float>> headStore, tailStore;   // puntas que esperan al tramo vecino
+
+    int chunksDone = 0;
+    for (const int k : order)
     {
         if (cancel.load())
         {
@@ -387,11 +372,11 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
             return false;
         }
 
-        // Tramo de entrada (con ceros si falta audio al final)
-        const int n = juce::jmin (kSegment, len44 - pos);
+        const int pos = k * stride;
+        const int n = juce::jmin (kSegment, srcN - pos);
         std::fill (inBuf.begin(), inBuf.end(), 0.0f);
-        std::copy (srcL.begin() + pos, srcL.begin() + pos + n, inBuf.begin());
-        std::copy (srcR.begin() + pos, srcR.begin() + pos + n, inBuf.begin() + kSegment);
+        std::copy (srcL + pos, srcL + pos + n, inBuf.begin());
+        std::copy (srcR + pos, srcR + pos + n, inBuf.begin() + kSegment);
 
         OrtValue* output = nullptr;
         if (! ok (api->Run (h.session, nullptr, inNames, &h.input, 1, outNames, 1, &output)))
@@ -404,7 +389,7 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
             return false;
         }
 
-        if (chunk == 0)
+        if (chunksDone == 0)
         {
             // Validar la forma de la salida: (1, stems, 2, 343980)
             OrtTensorTypeAndShapeInfo* info = nullptr;
@@ -419,90 +404,104 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
                 api->ReleaseTensorTypeAndShapeInfo (info);
             }
 
-            if (nd != 4 || dims[2] != 2 || dims[3] != kSegment || dims[1] < 1 || dims[1] > 8)
+            if (nd != 4 || dims[1] != nStems || dims[2] != 2 || dims[3] != kSegment)
             {
                 error = "El modelo de stems tiene una forma de salida inesperada.";
                 api->ReleaseValue (output);
                 return false;
             }
-
-            nStems = (int) dims[1];
-            acc.assign ((size_t) nStems * 2 * kSegment, 0.0f);
-            out.numStems = nStems;
-            out.numFrames = len44;
-            out.data.assign ((size_t) nStems * 2, std::vector<int16_t> ((size_t) len44, 0));
         }
 
-        // Sumar este tramo con su peso
-        for (int k = 0; k < nStems * 2; ++k)
+        // Escribe una parte del tramo tal cual salio del modelo
+        auto putRaw = [&] (int g0, int localStart, int count)
         {
-            const float* s = res + (size_t) k * kSegment;
-            float* a = acc.data() + (size_t) k * kSegment;
-            for (int i = 0; i < kSegment; ++i)
-                a[i] += s[i] * weight[(size_t) i];
+            const int n2 = juce::jmin (count, srcN - g0);
+            if (n2 <= 0)
+                return;
+            for (int c = 0; c < nCh; ++c)
+            {
+                const float* r = res + (size_t) c * kSegment + localStart;
+                int16_t* d = out.data[(size_t) c].data() + g0;
+                for (int i = 0; i < n2; ++i)
+                    d[i] = toI16 (r[i]);
+            }
+            out.markDone (g0, g0 + n2);
+        };
+
+        // Mezcla la punta final de un tramo con la punta inicial del siguiente
+        auto blend = [&] (int g0, const float* tBase, size_t tStride, const float* hBase, size_t hStride)
+        {
+            const int n2 = juce::jmin (overlapLen, srcN - g0);
+            if (n2 <= 0)
+                return;
+            for (int c = 0; c < nCh; ++c)
+            {
+                const float* t = tBase + (size_t) c * tStride;
+                const float* hd = hBase + (size_t) c * hStride;
+                int16_t* d = out.data[(size_t) c].data() + g0;
+                for (int i = 0; i < n2; ++i)
+                {
+                    const float wt = weight[(size_t) (stride + i)];
+                    const float wh = weight[(size_t) i];
+                    d[i] = toI16 ((t[i] * wt + hd[i] * wh) / (wt + wh));
+                }
+            }
+            out.markDone (g0, g0 + n2);
+        };
+
+        const bool last = (k == totalChunks - 1);
+
+        // Parte del medio: solo la cubre este tramo
+        putRaw (pos + overlapLen, overlapLen, (last ? kSegment : stride) - overlapLen);
+
+        // Punta inicial (se comparte con el tramo anterior)
+        if (k == 0)
+        {
+            putRaw (pos, 0, overlapLen);
         }
-        for (int i = 0; i < kSegment; ++i)
-            wacc[(size_t) i] += weight[(size_t) i];
+        else
+        {
+            auto it = tailStore.find (k - 1);
+            if (it != tailStore.end())
+            {
+                blend (pos, it->second.data(), (size_t) overlapLen, res, (size_t) kSegment);
+                tailStore.erase (it);
+            }
+            else
+            {
+                std::vector<float> hv ((size_t) nCh * overlapLen);
+                for (int c = 0; c < nCh; ++c)
+                    std::copy (res + (size_t) c * kSegment, res + (size_t) c * kSegment + overlapLen,
+                               hv.begin() + (size_t) c * overlapLen);
+                headStore[k] = std::move (hv);
+            }
+        }
+
+        // Punta final (se comparte con el tramo siguiente)
+        if (! last)
+        {
+            auto it = headStore.find (k + 1);
+            if (it != headStore.end())
+            {
+                blend ((k + 1) * stride, res + stride, (size_t) kSegment, it->second.data(), (size_t) overlapLen);
+                headStore.erase (it);
+            }
+            else
+            {
+                std::vector<float> tv ((size_t) nCh * overlapLen);
+                for (int c = 0; c < nCh; ++c)
+                    std::copy (res + (size_t) c * kSegment + stride, res + (size_t) c * kSegment + stride + overlapLen,
+                               tv.begin() + (size_t) c * overlapLen);
+                tailStore[k] = std::move (tv);
+            }
+        }
 
         api->ReleaseValue (output);
 
-        // Lo que ya no se va a pisar con el tramo siguiente queda terminado
-        const bool last = (pos + kSegment >= len44);
-        const int finalCount = last ? (len44 - pos) : stride;
-
-        for (int k = 0; k < nStems * 2; ++k)
-        {
-            const float* a = acc.data() + (size_t) k * kSegment;
-            int16_t* dst = out.data[(size_t) k].data() + pos;
-            for (int i = 0; i < finalCount; ++i)
-            {
-                const float wv = wacc[(size_t) i];
-                dst[i] = toI16 (wv > 1.0e-9f ? a[i] / wv : 0.0f);
-            }
-        }
-
-        progress.store (0.02f + 0.88f * (float) (chunk + 1) / (float) totalChunks);
-
-        if (last)
-            break;
-
-        // Correr lo que quedo pendiente (la zona que se pisa) al principio
-        for (int k = 0; k < nStems * 2; ++k)
-        {
-            float* a = acc.data() + (size_t) k * kSegment;
-            std::copy (a + stride, a + kSegment, a);
-            std::fill (a + overlapLen, a + kSegment, 0.0f);
-        }
-        std::copy (wacc.begin() + stride, wacc.begin() + kSegment, wacc.begin());
-        std::fill (wacc.begin() + overlapLen, wacc.end(), 0.0f);
-
-        pos += stride;
-    }
-
-    // --- 5) Volver a la frecuencia de muestreo original ---
-    if (needResample)
-    {
-        const double ratioBack = kModelRate / audioSR;
-        for (size_t k = 0; k < out.data.size(); ++k)
-        {
-            if (cancel.load())
-            {
-                error = "Cancelado";
-                return false;
-            }
-
-            std::vector<float> f ((size_t) len44);
-            for (int i = 0; i < len44; ++i)
-                f[(size_t) i] = (float) out.data[k][(size_t) i] / 32768.0f;
-
-            auto r = resampleChannel (f.data(), len44, ratioBack, srcN);
-            out.data[k].assign ((size_t) srcN, 0);
-            for (int i = 0; i < srcN; ++i)
-                out.data[k][(size_t) i] = toI16 (r[(size_t) i]);
-
-            progress.store (0.9f + 0.1f * (float) (k + 1) / (float) out.data.size());
-        }
-        out.numFrames = srcN;
+        ++chunksDone;
+        progress.store (0.02f + 0.98f * (float) chunksDone / (float) totalChunks);
+        if (onChunkDone)
+            onChunkDone();
     }
 
     progress.store (1.0f);

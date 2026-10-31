@@ -21,6 +21,7 @@ struct PadSlice
     float filter = 0.0f;     // -1 = pasa bajos, 0 = apagado, +1 = pasa altos
     float attack = 0.0f;     // segundos
     float release = 0.02f;   // segundos
+    bool toEnd = false;      // true = suena hasta el final del audio (sin linea de fin)
 };
 
 class TongaProcessor : public juce::AudioProcessor,
@@ -63,7 +64,7 @@ public:
     double getLengthSec() const { return sampleLengthSec.load(); }
     juce::String getSampleName() const;
     void getPeaks (double startSec, double lenSec, int columns,
-                   std::vector<float>& mins, std::vector<float>& maxs);
+                   std::vector<float>& mins, std::vector<float>& maxs, std::vector<juce::Colour>& colours);
 
     // --- Grilla / tempo ---
     double getOriginalBpm() const { return originalBpm.load(); }
@@ -101,13 +102,15 @@ public:
     bool hasStems() const { return stemsReady.load(); }
     float getStemProgress() const { return stemProgress.load(); }
     juce::String getStemMessage() const;
-    void stemThreadLoop (juce::Thread& thread); // uso interno del hilo de trabajo
+    void stemThreadLoop (juce::Thread& thread); // uso interno del hilo que separa
+    void mixThreadLoop (juce::Thread& thread);  // uso interno del hilo que mezcla
 
     // Informacion para la interfaz
     std::atomic<int> lastPlayedPad { 0 };
     std::atomic<int> playCounter { 0 };
     std::atomic<uint32_t> playingMask { 0 };
     std::atomic<double> lastPlayPosSec { -1.0 };
+    std::atomic<float> uiScale { 1.0f };
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -148,6 +151,7 @@ private:
     void doLoadCache();
     void doSeparate();
     void doRebuildMix();
+    void kickMix();
     void detectTempo();
     void buildTables (double sr);
     bool startVoice (int pad, int delaySamples);
@@ -167,7 +171,7 @@ private:
     juce::String samplePath;
 
     static constexpr int peakBlock = 128;
-    std::vector<float> peakMin, peakMax;
+    std::vector<float> peakMin, peakMax, peakLow, peakMid, peakHigh;
 
     std::array<PadSlice, numPads> slices;
     std::array<Voice, numPads + 1> voices;   // el ultimo es el del play del audio completo
@@ -200,6 +204,8 @@ private:
 
     // Stems
     std::unique_ptr<juce::Thread> stemThread;
+    std::unique_ptr<juce::Thread> mixThread;
+    std::shared_ptr<juce::AudioBuffer<float>> stemOrig;
     mutable juce::CriticalSection stemLock;
     std::shared_ptr<StemData> stems;
     mutable juce::CriticalSection msgLock;

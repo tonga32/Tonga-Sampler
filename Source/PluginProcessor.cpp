@@ -27,6 +27,60 @@ namespace
         return env;
     }
 
+
+    // Picos y energia por banda (graves / medios / agudos) de cada bloque de audio
+    void analyseBlocks (const juce::AudioBuffer<float>& b, double sr, int blockSize,
+                        std::vector<float>& mins, std::vector<float>& maxs,
+                        std::vector<float>& lows, std::vector<float>& mids, std::vector<float>& highs)
+    {
+        const int len = b.getNumSamples();
+        const int nb = (len + blockSize - 1) / blockSize;
+        mins.assign ((size_t) nb, 0.0f);
+        maxs.assign ((size_t) nb, 0.0f);
+        lows.assign ((size_t) nb, 0.0f);
+        mids.assign ((size_t) nb, 0.0f);
+        highs.assign ((size_t) nb, 0.0f);
+        if (len <= 0)
+            return;
+
+        const float pi2 = 2.0f * juce::MathConstants<float>::pi;
+        const float a1 = 1.0f - std::exp (-pi2 * 250.0f / (float) sr);
+        const float a2 = 1.0f - std::exp (-pi2 * 3000.0f / (float) sr);
+        float y1 = 0.0f, y2 = 0.0f;
+
+        const float* d0 = b.getReadPointer (0);
+        const float* d1 = b.getNumChannels() > 1 ? b.getReadPointer (1) : d0;
+
+        for (int blk = 0; blk < nb; ++blk)
+        {
+            const int s0 = blk * blockSize;
+            const int s1 = juce::jmin (len, s0 + blockSize);
+            float mn = 0.0f, mx = 0.0f, el = 0.0f, em = 0.0f, eh = 0.0f;
+
+            for (int i = s0; i < s1; ++i)
+            {
+                const float l = d0[i];
+                const float r = d1[i];
+                mn = juce::jmin (mn, l, r);
+                mx = juce::jmax (mx, l, r);
+
+                const float m = 0.5f * (l + r);
+                y1 += a1 * (m - y1);
+                y2 += a2 * (m - y2);
+                el += std::abs (y1);
+                em += std::abs (y2 - y1);
+                eh += std::abs (m - y2);
+            }
+
+            const float inv = 1.0f / (float) juce::jmax (1, s1 - s0);
+            mins[(size_t) blk] = mn;
+            maxs[(size_t) blk] = mx;
+            lows[(size_t) blk] = el * inv;
+            mids[(size_t) blk] = em * inv;
+            highs[(size_t) blk] = eh * inv;
+        }
+    }
+
     struct Onset  { double time; float strength; };
     struct Region { double start; double end; double score; };
 
@@ -156,8 +210,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout TongaProcessor::createLayout
                                                               juce::StringArray { "2/4", "3/4", "4/4", "6/8", "9/8", "12/8" }, 2));
     layout.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "division", 1 }, "Division del slicer",
                                                               juce::StringArray { "1/4", "1/2", "1", "2", "4" }, 2));
-    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "poly", 1 }, "Poly", true));
-    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "hold", 1 }, "Mantener", false));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "poly", 1 }, "Poly", false));
+    layout.add (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "hold", 1 }, "Mantener", true));
     layout.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "volume", 1 }, "Volumen",
                                                              juce::NormalisableRange<float> (0.0f, 2.0f, 0.01f), 1.0f));
     for (int i = 0; i < 4; ++i)
@@ -177,6 +231,16 @@ namespace
     public:
         explicit StemThread (TongaProcessor& p) : juce::Thread ("Tonga stems"), proc (p) {}
         void run() override { proc.stemThreadLoop (*this); }
+
+    private:
+        TongaProcessor& proc;
+    };
+
+    class MixThread : public juce::Thread
+    {
+    public:
+        explicit MixThread (TongaProcessor& p) : juce::Thread ("Tonga mezcla"), proc (p) {}
+        void run() override { proc.mixThreadLoop (*this); }
 
     private:
         TongaProcessor& proc;
@@ -209,6 +273,8 @@ TongaProcessor::TongaProcessor()
 
     stemThread = std::make_unique<StemThread> (*this);
     stemThread->startThread();
+    mixThread = std::make_unique<MixThread> (*this);
+    mixThread->startThread();
 }
 
 TongaProcessor::~TongaProcessor()
@@ -216,6 +282,8 @@ TongaProcessor::~TongaProcessor()
     stemCancel.store (true);
     if (stemThread != nullptr)
         stemThread->stopThread (30000);
+    if (mixThread != nullptr)
+        mixThread->stopThread (10000);
 
     for (int i = 0; i < 4; ++i)
         apvts.removeParameterListener (juce::String ("stem") + juce::String (i), this);
@@ -349,34 +417,36 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid, bool use
 
     juce::AudioBuffer<float> tmp (chs, len);
     reader->read (&tmp, 0, len, 0, true, chs > 1);
+    double rate = reader->sampleRate;
 
-    // Picos para dibujar la onda
-    const int nb = (len + peakBlock - 1) / peakBlock;
-    std::vector<float> mins ((size_t) nb, 0.0f), maxs ((size_t) nb, 0.0f);
-    for (int b = 0; b < nb; ++b)
+    // Todo trabaja a 44.1 kHz (asi los stems quedan alineados con el audio)
+    if (std::abs (rate - 44100.0) > 0.5)
     {
-        const int s0 = b * peakBlock;
-        const int s1 = juce::jmin (len, s0 + peakBlock);
-        float mn = 0.0f, mx = 0.0f;
-        for (int ch = 0; ch < chs; ++ch)
+        const double ratio = rate / 44100.0;
+        const int newLen = (int) std::floor ((double) len / ratio);
+        juce::AudioBuffer<float> conv (chs, newLen);
+        for (int c = 0; c < chs; ++c)
         {
-            const float* d = tmp.getReadPointer (ch);
-            for (int i = s0; i < s1; ++i)
-            {
-                mn = juce::jmin (mn, d[i]);
-                mx = juce::jmax (mx, d[i]);
-            }
+            std::vector<float> padded ((size_t) len + 64, 0.0f);
+            std::copy (tmp.getReadPointer (c), tmp.getReadPointer (c) + len, padded.begin());
+            juce::LagrangeInterpolator li;
+            li.process (ratio, padded.data(), conv.getWritePointer (c), newLen);
         }
-        mins[(size_t) b] = mn;
-        maxs[(size_t) b] = mx;
+        tmp = std::move (conv);
+        rate = 44100.0;
     }
+    const int nframes = tmp.getNumSamples();
+
+    // Picos y colores por frecuencia para dibujar la onda
+    std::vector<float> mins, maxs, lows, mids, highs;
+    analyseBlocks (tmp, rate, peakBlock, mins, maxs, lows, mids, highs);
 
     {
         const juce::ScopedLock sl (dataLock);
         sample = std::move (tmp);
-        fileSampleRate = reader->sampleRate;
+        fileSampleRate = rate;
         samplePath = file.getFullPathName();
-        sampleLengthSec.store ((double) len / fileSampleRate);
+        sampleLengthSec.store ((double) nframes / fileSampleRate);
         for (auto& v : voices) v.active = false;
         for (auto& sl2 : slices) sl2 = PadSlice();
         cursorSec.store (0.0);
@@ -388,6 +458,7 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid, bool use
     {
         const juce::ScopedLock sl2 (stemLock);
         stems.reset();
+        stemOrig.reset();
     }
     setStemMessage (juce::String());
 
@@ -395,6 +466,9 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid, bool use
         const juce::ScopedLock pl (peakLock);
         peakMin = std::move (mins);
         peakMax = std::move (maxs);
+        peakLow = std::move (lows);
+        peakMid = std::move (mids);
+        peakHigh = std::move (highs);
     }
 
     if (detectGrid)
@@ -412,15 +486,21 @@ bool TongaProcessor::loadFile (const juce::File& file, bool detectGrid, bool use
 }
 
 void TongaProcessor::getPeaks (double startSec, double lenSec, int columns,
-                               std::vector<float>& mins, std::vector<float>& maxs)
+                               std::vector<float>& mins, std::vector<float>& maxs,
+                               std::vector<juce::Colour>& colours)
 {
-    mins.assign ((size_t) juce::jmax (0, columns), 0.0f);
-    maxs.assign ((size_t) juce::jmax (0, columns), 0.0f);
+    const size_t cols = (size_t) juce::jmax (0, columns);
+    mins.assign (cols, 0.0f);
+    maxs.assign (cols, 0.0f);
+    colours.assign (cols, juce::Colour (0xff8a8a96));
 
     const juce::ScopedLock sl (peakLock);
     const int nb = (int) peakMin.size();
     if (nb == 0 || columns <= 0 || lenSec <= 0.0)
         return;
+
+    // Graves en rosa-rojo, medios en amarillo y agudos en celeste (como la onda de colores de Serato)
+    const juce::Colour cLow (0xfff2547d), cMid (0xffffd200), cHigh (0xff7fd8ff);
 
     const double dur = sampleLengthSec.load();
     const double perCol = lenSec / (double) columns;
@@ -437,14 +517,30 @@ void TongaProcessor::getPeaks (double startSec, double lenSec, int columns,
         b0 = juce::jlimit (0, nb - 1, b0);
         b1 = juce::jlimit (b0, nb - 1, b1);
 
-        float mn = 0.0f, mx = 0.0f;
+        float mn = 0.0f, mx = 0.0f, el = 0.0f, em = 0.0f, eh = 0.0f;
         for (int b = b0; b <= b1; ++b)
         {
             mn = juce::jmin (mn, peakMin[(size_t) b]);
             mx = juce::jmax (mx, peakMax[(size_t) b]);
+            el += peakLow[(size_t) b];
+            em += peakMid[(size_t) b];
+            eh += peakHigh[(size_t) b];
         }
         mins[(size_t) c] = mn;
         maxs[(size_t) c] = mx;
+
+        const float wl = el;
+        const float wm = em * 2.2f;
+        const float wh = eh * 6.0f;
+        const float tot = wl + wm + wh;
+        if (tot > 1.0e-9f)
+        {
+            colours[(size_t) c] = juce::Colour::fromFloatRGBA (
+                (wl * cLow.getFloatRed()   + wm * cMid.getFloatRed()   + wh * cHigh.getFloatRed())   / tot,
+                (wl * cLow.getFloatGreen() + wm * cMid.getFloatGreen() + wh * cHigh.getFloatGreen()) / tot,
+                (wl * cLow.getFloatBlue()  + wm * cMid.getFloatBlue()  + wh * cHigh.getFloatBlue())  / tot,
+                1.0f);
+        }
     }
 }
 
@@ -579,6 +675,7 @@ void TongaProcessor::applySlicing (int mode)
         slices[(size_t) i].valid = out[(size_t) i].valid;
         slices[(size_t) i].start = out[(size_t) i].start;
         slices[(size_t) i].end = out[(size_t) i].end;
+        slices[(size_t) i].toEnd = false;
     }
 }
 
@@ -658,6 +755,7 @@ bool TongaProcessor::startVoice (int pad, int delaySamples)
         sl.valid = true;
         sl.start = c;
         sl.end = dur;
+        sl.toEnd = true;
     }
 
     const double startS = juce::jmax (0.0, sl.start * fileSampleRate);
@@ -1016,24 +1114,29 @@ juce::String TongaProcessor::getStemMessage() const
     return stemMessage;
 }
 
+void TongaProcessor::kickMix()
+{
+    mixDirty.store (true);
+    if (mixThread != nullptr)
+        mixThread->notify();
+}
+
 void TongaProcessor::parameterChanged (const juce::String& parameterID, float)
 {
     if (parameterID.startsWith ("stem"))
-    {
-        mixDirty.store (true);
-        if (stemThread != nullptr)
-            stemThread->notify();
-    }
+        kickMix();
 }
 
+// Stems ya completos (por ejemplo, cargados del archivo .tonga-stems)
 void TongaProcessor::installStems (std::shared_ptr<StemData> data)
 {
     {
         const juce::ScopedLock l (stemLock);
         stems = std::move (data);
+        stemOrig.reset();
     }
     stemsReady.store (true);
-    mixDirty.store (true);
+    kickMix();
 }
 
 void TongaProcessor::startStemSeparation()
@@ -1072,10 +1175,18 @@ void TongaProcessor::stemThreadLoop (juce::Thread& t)
         if (separateRequested.exchange (false))
             doSeparate();
 
+        t.wait (150);
+    }
+}
+
+void TongaProcessor::mixThreadLoop (juce::Thread& t)
+{
+    while (! t.threadShouldExit())
+    {
         if (mixDirty.exchange (false))
             doRebuildMix();
 
-        t.wait (150);
+        t.wait (100);
     }
 }
 
@@ -1116,12 +1227,12 @@ void TongaProcessor::doSeparate()
     }
     const int frames = stemAudio.getNumSamples();
     const double sr = stemAudioSR;
+    const int gen = stemGeneration;
 
     // 1) Si ya estaba separado y guardado, usar eso
     {
         auto cached = std::make_shared<StemData>();
-        if (StemSeparator::loadCache (audioFile, sr, frames, *cached)
-            && stemGeneration == sampleGeneration.load())
+        if (StemSeparator::loadCache (audioFile, sr, frames, *cached) && gen == sampleGeneration.load())
         {
             stemAudio.setSize (0, 0);
             installStems (cached);
@@ -1132,22 +1243,36 @@ void TongaProcessor::doSeparate()
         }
     }
 
-    // 2) Separar con el modelo
-    StemData result;
-    juce::String err;
-    const bool ok = StemSeparator::separate (stemAudio, sr, result, stemProgress, stemCancel, err);
+    // 2) Preparar: stems vacios (todo "pendiente") y una copia estereo del original
+    auto data = std::make_shared<StemData>();
+    data->init (4, frames, false);
+
+    auto orig = std::make_shared<juce::AudioBuffer<float>> (2, frames);
+    for (int c = 0; c < 2; ++c)
+        orig->copyFrom (c, 0, stemAudio, juce::jmin (c, stemAudio.getNumChannels() - 1), 0, frames);
     stemAudio.setSize (0, 0);
 
-    if (ok && stemGeneration == sampleGeneration.load())
     {
-        auto data = std::make_shared<StemData> (std::move (result));
-        installStems (data);
-        doRebuildMix();                 // que ya se escuche con los volumenes actuales
+        const juce::ScopedLock l (stemLock);
+        stems = data;
+        stemOrig = orig;
+    }
+    stemsReady.store (true);
+    kickMix();
 
+    // 3) Separar, empezando por donde esta el cursor. Cada tramo que termina ya se puede escuchar.
+    const int startFrame = (int) (cursorSec.load() * sr);
+    juce::String err;
+    const bool ok = StemSeparator::separate (*orig, sr, *data, startFrame, stemProgress, stemCancel,
+                                             [this] { kickMix(); }, err);
+
+    if (ok && gen == sampleGeneration.load())
+    {
         stemProgress.store (1.0f);
+        kickMix();
         stemBusy.store (false);
 
-        // 3) Guardar los stems junto al audio, para no tener que volver a separar
+        // 4) Guardar los stems junto al audio, para no tener que volver a separar
         setStemMessage ("Guardando stems...");
         juce::String where;
         if (StemSeparator::saveCache (audioFile, sr, *data, where))
@@ -1157,13 +1282,39 @@ void TongaProcessor::doSeparate()
         return;
     }
 
-    if (! ok)
-        setStemMessage (err.isNotEmpty() ? err : juce::String ("No se pudo separar."));
+    // Cancelado o con error: volver al audio original
+    if (gen == sampleGeneration.load())
+    {
+        stemsReady.store (false);
+        {
+            const juce::ScopedLock l (stemLock);
+            stems.reset();
+            stemOrig.reset();
+        }
+        {
+            const juce::ScopedLock l (dataLock);
+            if (gen == sampleGeneration.load() && sample.getNumSamples() == frames)
+                sample.makeCopyOf (*orig);
+        }
 
+        std::vector<float> mn, mx, lo, mi, hi;
+        analyseBlocks (*orig, sr, peakBlock, mn, mx, lo, mi, hi);
+        const juce::ScopedLock pl (peakLock);
+        peakMin = std::move (mn);
+        peakMax = std::move (mx);
+        peakLow = std::move (lo);
+        peakMid = std::move (mi);
+        peakHigh = std::move (hi);
+    }
+
+    setStemMessage (err.isNotEmpty() ? err : juce::String ("No se pudo separar."));
     stemProgress.store (1.0f);
     stemBusy.store (false);
 }
 
+// Arma el audio que suena: lo ya separado con los volumenes de cada stem.
+// Si se toco algun volumen, lo que todavia no se separo queda en silencio (como en Serato);
+// si no, esas partes suenan con el audio original.
 void TongaProcessor::doRebuildMix()
 {
     if (! stemsReady.load())
@@ -1171,43 +1322,103 @@ void TongaProcessor::doRebuildMix()
 
     const int gen = sampleGeneration.load();
     float vol[4];
+    bool neutral = true;
     for (int i = 0; i < 4; ++i)
+    {
         vol[i] = stemParam[i]->load();
+        if (std::abs (vol[i] - 1.0f) > 0.001f)
+            neutral = false;
+    }
 
     std::shared_ptr<StemData> snap;
+    std::shared_ptr<juce::AudioBuffer<float>> orig;
     {
         const juce::ScopedLock l (stemLock);
         snap = stems;
+        orig = stemOrig;
     }
-    if (snap == nullptr || snap->numStems != 4 || snap->numFrames <= 0)
+    if (snap == nullptr || snap->numStems != 4 || snap->numFrames <= 0 || snap->done == nullptr)
         return;
 
     const int n = snap->numFrames;
-    juce::AudioBuffer<float> mix (2, n);
-    mix.clear();
+    const bool pendingSilent = ! neutral;
 
+    juce::AudioBuffer<float> mix (2, n);
     float* dl = mix.getWritePointer (0);
     float* dr = mix.getWritePointer (1);
-    const float k = 1.0f / 32768.0f;
+    const float* ol = orig != nullptr ? orig->getReadPointer (0) : nullptr;
+    const float* orr = orig != nullptr ? orig->getReadPointer (orig->getNumChannels() > 1 ? 1 : 0) : nullptr;
 
+    const int16_t* sl[4];
+    const int16_t* sr[4];
+    float g[4];
     for (int st = 0; st < 4; ++st)
     {
-        const float g = vol[st] * k;
-        if (g <= 0.0f)
-            continue;
+        sl[st] = snap->data[(size_t) st * 2].data();
+        sr[st] = snap->data[(size_t) st * 2 + 1].data();
+        g[st] = vol[st] / 32768.0f;
+    }
 
-        const int16_t* sl = snap->data[(size_t) st * 2].data();
-        const int16_t* sr = snap->data[(size_t) st * 2 + 1].data();
-        for (int i = 0; i < n; ++i)
+    bool anyPending = false;
+    for (int i = 0; i < n; ++i)
+    {
+        if (snap->isDone (i))
         {
-            dl[i] += g * (float) sl[i];
-            dr[i] += g * (float) sr[i];
+            float l = 0.0f, r = 0.0f;
+            for (int st = 0; st < 4; ++st)
+            {
+                l += g[st] * (float) sl[st][i];
+                r += g[st] * (float) sr[st][i];
+            }
+            dl[i] = l;
+            dr[i] = r;
+        }
+        else
+        {
+            anyPending = true;
+            if (! pendingSilent && ol != nullptr)
+            {
+                dl[i] = ol[i];
+                dr[i] = orr[i];
+            }
+            else
+            {
+                dl[i] = 0.0f;
+                dr[i] = 0.0f;
+            }
         }
     }
 
-    const juce::ScopedLock lock (dataLock);
-    if (gen == sampleGeneration.load() && stemsReady.load() && sample.getNumSamples() == mix.getNumSamples())
-        sample = std::move (mix);
+    // La onda se dibuja con los colores de lo que realmente suena
+    std::vector<float> mn, mx, lo, mi, hi;
+    analyseBlocks (mix, fileSampleRate, peakBlock, mn, mx, lo, mi, hi);
+
+    bool installed = false;
+    {
+        const juce::ScopedLock lock (dataLock);
+        if (gen == sampleGeneration.load() && stemsReady.load() && sample.getNumSamples() == n)
+        {
+            sample = std::move (mix);
+            installed = true;
+        }
+    }
+
+    if (installed)
+    {
+        const juce::ScopedLock pl (peakLock);
+        peakMin = std::move (mn);
+        peakMax = std::move (mx);
+        peakLow = std::move (lo);
+        peakMid = std::move (mi);
+        peakHigh = std::move (hi);
+    }
+
+    // Cuando ya esta todo separado, no hace falta guardar el original
+    if (! anyPending && orig != nullptr)
+    {
+        const juce::ScopedLock l (stemLock);
+        stemOrig.reset();
+    }
 }
 
 // Vuelve al audio original (el archivo .tonga-stems queda guardado en el disco)
@@ -1247,7 +1458,8 @@ void TongaProcessor::getStateInformation (juce::MemoryBlock& destData)
             sl << (s.valid ? 1 : 0) << "," << s.start << "," << s.end << ","
                << s.gain << "," << (s.reverse ? 1 : 0) << ","
                << s.keyShift << "," << s.stretch << ","
-               << s.filter << "," << s.attack << "," << s.release << ";";
+               << s.filter << "," << s.attack << "," << s.release << ","
+               << (s.toEnd ? 1 : 0) << ";";
         state.setProperty ("samplePath", samplePath, nullptr);
     }
 
@@ -1257,6 +1469,7 @@ void TongaProcessor::getStateInformation (juce::MemoryBlock& destData)
     state.setProperty ("slices", sl, nullptr);
     state.setProperty ("lastMode", lastMode.load(), nullptr);
     state.setProperty ("stemsDisabled", stemsDisabled.load(), nullptr);
+    state.setProperty ("uiScale", (double) uiScale.load(), nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
@@ -1277,6 +1490,7 @@ void TongaProcessor::setStateInformation (const void* data, int sizeInBytes)
     const juce::String path = vt.getProperty ("samplePath", "").toString();
     const bool stemsOff = (bool) vt.getProperty ("stemsDisabled", false);
     stemsDisabled.store (stemsOff);
+    uiScale.store (juce::jlimit (0.5f, 1.0f, (float) (double) vt.getProperty ("uiScale", 1.0)));
     if (path.isNotEmpty() && juce::File (path).existsAsFile())
         loadFile (juce::File (path), false, ! stemsOff);
 
@@ -1302,7 +1516,9 @@ void TongaProcessor::setStateInformation (const void* data, int sizeInBytes)
                 s.end = f[2].getDoubleValue();
                 s.gain = (float) f[3].getDoubleValue();
                 s.reverse = f[4].getIntValue() != 0;
-                if (f.size() == 10)
+                if (f.size() >= 11)
+                    s.toEnd = f[10].getIntValue() != 0;
+                if (f.size() >= 10)
                 {
                     s.keyShift = f[5].getIntValue();
                     s.stretch = (float) f[6].getDoubleValue();
