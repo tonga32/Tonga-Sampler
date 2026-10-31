@@ -1292,6 +1292,8 @@ void TongaEditor::timerCallback()
 
         if (busy)
             stemsButton.setButtonText ("Cancelar " + juce::String (juce::roundToInt (proc.getStemProgress() * 100.0f)) + "%");
+        else if (proc.isStemLoading())
+            stemsButton.setButtonText ("Cargando stems...");
         else if (has)
             stemsButton.setButtonText ("Stems");
         else
@@ -1343,6 +1345,10 @@ void TongaEditor::timerCallback()
         hint = "A y B = inicio de 2 compases seguidos";
     else if (proc.isStemBusy())
         hint = "Separando stems... puede tardar unos minutos";
+    else if (proc.hasStems() && proc.getStemMessage().startsWith ("Guardando"))
+        hint = "Guardando los stems junto al audio...";
+    else if (proc.hasStems() && proc.getStemMessage().startsWith ("Listo,"))
+        hint = proc.getStemMessage();
     else if (proc.hasSample() && lm < 0 && proc.getValidMask() == 0)
         hint = "Click en la onda = cursor. Pad vacio = se asigna ahi";
     hintLabel.setText (hint, juce::dontSendNotification);

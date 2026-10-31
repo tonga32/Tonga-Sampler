@@ -5,6 +5,7 @@
 #include <atomic>
 #include <vector>
 #include "StemSeparator.h"
+#include <memory>
 
 // Un corte (slice) asignado a un pad, con sus ajustes propios.
 // Las posiciones estan en segundos del audio original.
@@ -57,7 +58,7 @@ public:
     void setStateInformation (const void* data, int sizeInBytes) override;
 
     // --- Audio cargado ---
-    bool loadFile (const juce::File& file, bool detectGrid = true);
+    bool loadFile (const juce::File& file, bool detectGrid = true, bool useStemCache = true);
     bool hasSample() const { return sampleLengthSec.load() > 0.0; }
     double getLengthSec() const { return sampleLengthSec.load(); }
     juce::String getSampleName() const;
@@ -96,6 +97,7 @@ public:
     void cancelStemSeparation() { stemCancel.store (true); }
     void removeStems();                         // vuelve al audio original
     bool isStemBusy() const { return stemBusy.load(); }
+    bool isStemLoading() const { return stemLoading.load(); }   // cargando el archivo .tonga-stems
     bool hasStems() const { return stemsReady.load(); }
     float getStemProgress() const { return stemProgress.load(); }
     juce::String getStemMessage() const;
@@ -142,6 +144,8 @@ private:
 
     void parameterChanged (const juce::String& parameterID, float newValue) override;
     void setStemMessage (const juce::String& m);
+    void installStems (std::shared_ptr<StemData> data);
+    void doLoadCache();
     void doSeparate();
     void doRebuildMix();
     void detectTempo();
@@ -197,7 +201,8 @@ private:
     // Stems
     std::unique_ptr<juce::Thread> stemThread;
     mutable juce::CriticalSection stemLock;
-    StemData stems;
+    std::shared_ptr<StemData> stems;
+    mutable juce::CriticalSection msgLock;
     juce::String stemMessage;
     juce::AudioBuffer<float> stemAudio;
     double stemAudioSR = 44100.0;
@@ -208,6 +213,9 @@ private:
     std::atomic<bool> stemCancel { false };
     std::atomic<bool> separateRequested { false };
     std::atomic<bool> mixDirty { false };
+    std::atomic<bool> cacheRequested { false };
+    std::atomic<bool> stemLoading { false };
+    std::atomic<bool> stemsDisabled { false };
     std::atomic<float> stemProgress { 0.0f };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaProcessor)

@@ -22,6 +22,11 @@ namespace StemSeparator
     // true si estan el modelo y onnxruntime.dll; si no, explica que falta
     bool isAvailable (juce::String& whyNot);
 
+    // Archivo de stems guardado junto al audio (como Serato): "cancion.mp3.tonga-stems".
+    // Si no se puede escribir ahi, se usa la carpeta de datos de Tonga Sampler 2.
+    bool saveCache (const juce::File& audio, double sampleRate, const StemData& data, juce::String& whereOrError);
+    bool loadCache (const juce::File& audio, double sampleRate, int expectedFrames, StemData& out);
+
     // Separa el audio (cualquier frecuencia de muestreo, mono o estereo).
     // Bloquea hasta terminar: llamarlo desde un hilo aparte.
     bool separate (const juce::AudioBuffer<float>& audio, double audioSampleRate, StemData& out,

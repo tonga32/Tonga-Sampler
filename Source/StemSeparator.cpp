@@ -43,6 +43,107 @@ namespace
         return out;
     }
 
+
+    // ---- Archivo de stems guardado (cache) ----
+    constexpr int kCacheMagic = 0x4D545354;   // "TSTM"
+    constexpr int kCacheVersion = 1;
+
+    juce::File cacheNextTo (const juce::File& audio)
+    {
+        return audio.getSiblingFile (audio.getFileName() + ".tonga-stems");
+    }
+
+    juce::File cacheFallback (const juce::File& audio)
+    {
+        return appDataDir().getChildFile ("stems-cache")
+                           .getChildFile (audio.getFileName() + "-"
+                                          + juce::String::toHexString (audio.getFullPathName().hashCode64())
+                                          + ".tonga-stems");
+    }
+
+    bool writeCacheTo (const juce::File& target, const juce::File& audio, double sr, const StemData& d)
+    {
+        target.getParentDirectory().createDirectory();
+        const juce::File tmp = target.getSiblingFile (target.getFileName() + ".tmp");
+        tmp.deleteFile();
+
+        bool good = false;
+        {
+            juce::FileOutputStream os (tmp);
+            if (os.failedToOpen())
+                return false;
+
+            os.writeInt (kCacheMagic);
+            os.writeInt (kCacheVersion);
+            os.writeInt (d.numStems);
+            os.writeInt (d.numFrames);
+            os.writeDouble (sr);
+            os.writeInt64 (audio.getSize());
+            os.writeInt64 (audio.getLastModificationTime().toMilliseconds());
+
+            good = true;
+            for (auto& v : d.data)
+            {
+                if (! os.write (v.data(), v.size() * sizeof (int16_t)))
+                {
+                    good = false;
+                    break;
+                }
+            }
+            os.flush();
+            if (os.getStatus().failed())
+                good = false;
+        }
+
+        if (! good)
+        {
+            tmp.deleteFile();
+            return false;
+        }
+        return tmp.moveFileTo (target);
+    }
+
+    bool readCacheFrom (const juce::File& f, const juce::File& audio, double sr, int expectedFrames, StemData& out)
+    {
+        if (! f.existsAsFile())
+            return false;
+
+        juce::FileInputStream is (f);
+        if (is.failedToOpen())
+            return false;
+
+        if (is.readInt() != kCacheMagic || is.readInt() != kCacheVersion)
+            return false;
+
+        const int ns = is.readInt();
+        const int nf = is.readInt();
+        const double fsr = is.readDouble();
+        const juce::int64 asize = is.readInt64();
+        const juce::int64 amod = is.readInt64();
+
+        // Tiene que ser exactamente el mismo audio que cuando se separo
+        if (ns < 1 || ns > 8 || nf != expectedFrames || std::abs (fsr - sr) > 0.5)
+            return false;
+        if (asize != audio.getSize() || amod != audio.getLastModificationTime().toMilliseconds())
+            return false;
+
+        out.numStems = ns;
+        out.numFrames = nf;
+        out.data.assign ((size_t) ns * 2, std::vector<int16_t>());
+
+        for (auto& v : out.data)
+        {
+            v.resize ((size_t) nf);
+            const size_t bytes = (size_t) nf * sizeof (int16_t);
+            if ((size_t) is.read (v.data(), (int) bytes) != bytes)
+            {
+                out = StemData();
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Libera todo lo de onnxruntime al salir, pase lo que pase
     struct OrtHandles
     {
@@ -108,6 +209,33 @@ bool StemSeparator::isAvailable (juce::String& whyNot)
     }
     return true;
    #endif
+}
+
+
+bool StemSeparator::saveCache (const juce::File& audio, double sampleRate, const StemData& data, juce::String& whereOrError)
+{
+    if (writeCacheTo (cacheNextTo (audio), audio, sampleRate, data))
+    {
+        whereOrError = cacheNextTo (audio).getFullPathName();
+        return true;
+    }
+
+    // Carpeta del audio sin permiso de escritura: usar la de Tonga Sampler 2
+    if (writeCacheTo (cacheFallback (audio), audio, sampleRate, data))
+    {
+        whereOrError = cacheFallback (audio).getFullPathName();
+        return true;
+    }
+
+    whereOrError = "no hay permiso o espacio para escribir en " + audio.getParentDirectory().getFullPathName();
+    return false;
+}
+
+bool StemSeparator::loadCache (const juce::File& audio, double sampleRate, int expectedFrames, StemData& out)
+{
+    if (readCacheFrom (cacheNextTo (audio), audio, sampleRate, expectedFrames, out))
+        return true;
+    return readCacheFrom (cacheFallback (audio), audio, sampleRate, expectedFrames, out);
 }
 
 //==============================================================================
