@@ -130,6 +130,48 @@ namespace
         return true;
     }
 
+
+    // Deja en %APPDATA%\Tonga Sampler 2\stems-log.txt cuanto tardo cada separacion (sirve para medir la velocidad)
+    struct SepLog
+    {
+        double t0 = juce::Time::getMillisecondCounterHiRes();
+        double loadedAt = 0.0;
+        int threads = 0;
+        int frames = 0;
+        int chunks = 0;
+        int totalChunks = 0;
+        bool completed = false;
+
+        ~SepLog()
+        {
+            if (frames <= 0 || threads <= 0)
+                return;
+
+            const double totalSec = (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0;
+            const double loadSec = loadedAt > 0.0 ? (loadedAt - t0) / 1000.0 : 0.0;
+            const double audioSec = (double) frames / 44100.0;
+            const double procSec = juce::jmax (0.001, totalSec - loadSec);
+
+            juce::String text;
+            text << juce::Time::getCurrentTime().toString (true, true) << "\n"
+                 << "  CPU: " << juce::SystemStats::getCpuModel() << "\n"
+                 << "  Nucleos fisicos: " << juce::SystemStats::getNumPhysicalCpus()
+                 << "  logicos: " << juce::SystemStats::getNumCpus() << "  hilos usados: " << threads << "\n"
+                 << "  Audio: " << juce::String (audioSec, 1) << " s   tramos: " << chunks << " de " << totalChunks
+                 << (completed ? "  (completo)" : "  (incompleto)") << "\n"
+                 << "  Carga del modelo: " << juce::String (loadSec, 1) << " s   separacion: " << juce::String (procSec, 1) << " s\n";
+            if (chunks > 0)
+                text << "  Por tramo: " << juce::String (procSec / (double) chunks, 2) << " s   "
+                     << "velocidad: " << juce::String (audioSec * ((double) chunks / (double) juce::jmax (1, totalChunks)) / procSec, 2)
+                     << "x tiempo real\n";
+            text << "\n";
+
+            auto f = appDataDir().getChildFile ("stems-log.txt");
+            f.getParentDirectory().createDirectory();
+            f.appendText (text);
+        }
+    };
+
     // Libera todo lo de onnxruntime al salir, pase lo que pase
     struct OrtHandles
     {
@@ -280,6 +322,9 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
         return false;
     }
 
+    SepLog sepLog;
+    sepLog.frames = srcN;
+
     OrtHandles h;
     h.api = api;
 
@@ -298,14 +343,20 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
     if (! ok (api->CreateSessionOptions (&h.opts)))
         return false;
 
-    const int threads = juce::jmax (1, juce::SystemStats::getNumPhysicalCpus());
+    // Deja libre una parte del procesador (para que el DAW siga fluido) y sin "espera activa"
+    const int cores = juce::jmax (1, juce::SystemStats::getNumPhysicalCpus());
+    const int threads = juce::jmax (1, (cores * 3) / 4);
+    sepLog.threads = threads;
     ok (api->SetIntraOpNumThreads (h.opts, threads));
     ok (api->SetInterOpNumThreads (h.opts, 1));
+    ok (api->AddSessionConfigEntry (h.opts, "session.intra_op.allow_spinning", "0"));
     ok (api->SetSessionGraphOptimizationLevel (h.opts, ORT_ENABLE_ALL));
 
     progress.store (0.01f);
     if (! ok (api->CreateSession (h.env, findModel().getFullPathName().toWideCharPointer(), h.opts, &h.session)))
         return false;
+
+    sepLog.loadedAt = juce::Time::getMillisecondCounterHiRes();
 
     OrtAllocator* alloc = nullptr;
     if (! ok (api->GetAllocatorWithDefaultOptions (&alloc)))
@@ -347,6 +398,7 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
                                         : (float) (kSegment - i) / (float) half;
 
     const int totalChunks = 1 + (srcN > kSegment ? (int) std::ceil ((double) (srcN - kSegment) / (double) stride) : 0);
+    sepLog.totalChunks = totalChunks;
 
     // Orden: empieza en el tramo del cursor, sigue hacia adelante y despues vuelve hacia atras
     const int firstChunk = juce::jlimit (0, totalChunks - 1, startFrame / stride);
@@ -499,12 +551,14 @@ bool StemSeparator::separate (const juce::AudioBuffer<float>& audio, double audi
         api->ReleaseValue (output);
 
         ++chunksDone;
+        sepLog.chunks = chunksDone;
         progress.store (0.02f + 0.98f * (float) chunksDone / (float) totalChunks);
         if (onChunkDone)
             onChunkDone();
     }
 
     progress.store (1.0f);
+    sepLog.completed = true;
     return true;
    #endif
 }

@@ -101,6 +101,7 @@ public:
     bool isStemLoading() const { return stemLoading.load(); }   // cargando el archivo .tonga-stems
     bool hasStems() const { return stemsReady.load(); }
     float getStemProgress() const { return stemProgress.load(); }
+    double getStemElapsedSec() const { return (juce::Time::getMillisecondCounterHiRes() - stemStartMs.load()) / 1000.0; }
     juce::String getStemMessage() const;
     void stemThreadLoop (juce::Thread& thread); // uso interno del hilo que separa
     void mixThreadLoop (juce::Thread& thread);  // uso interno del hilo que mezcla
@@ -223,6 +224,7 @@ private:
     std::atomic<bool> stemLoading { false };
     std::atomic<bool> stemsDisabled { false };
     std::atomic<float> stemProgress { 0.0f };
+    std::atomic<double> stemStartMs { 0.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TongaProcessor)
 };

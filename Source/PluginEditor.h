@@ -63,7 +63,8 @@ public:
     void drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height, float pos,
                            float startAngle, float endAngle, juce::Slider& s) override
     {
-        auto bounds = juce::Rectangle<int> (x, y, width, height).toFloat().reduced (6.0f);
+        const float margin = juce::jmin (6.0f, (float) juce::jmin (width, height) * 0.12f);
+        auto bounds = juce::Rectangle<int> (x, y, width, height).toFloat().reduced (margin);
         const float radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
         const float cx = bounds.getCentreX();
         const float cy = bounds.getCentreY();
@@ -93,6 +94,19 @@ public:
         pointer.addRoundedRectangle (-1.5f, -radius * 0.72f, 3.0f, radius * 0.42f, 1.5f);
         g.setColour (accent);
         g.fillPath (pointer, juce::AffineTransform::rotation (angle).translated (cx, cy));
+
+        // Perillas sin cuadrito de texto: el valor aparece en el centro mientras se arrastra
+        if (s.getTextBoxPosition() == juce::Slider::NoTextBox && s.isMouseButtonDown())
+        {
+            const float r2 = radius * 0.62f;
+            g.setColour (TongaColours::inset.withAlpha (0.92f));
+            g.fillEllipse (cx - r2, cy - r2, r2 * 2.0f, r2 * 2.0f);
+            g.setColour (juce::Colours::white);
+            g.setFont (juce::Font (juce::jmax (9.0f, radius * 0.5f), juce::Font::bold));
+            g.drawText (s.getTextFromValue (s.getValue()),
+                        juce::Rectangle<float> (cx - radius, cy - 8.0f, radius * 2.0f, 16.0f).toNearestInt(),
+                        juce::Justification::centred);
+        }
     }
 
     // Flechitas chicas para los controles tipo +/- (como en Serato)
@@ -266,7 +280,8 @@ private:
 };
 
 //==============================================================================
-// Panel de los stems: un boton para silenciar y una perilla de volumen por stem
+// Stems: siempre a la vista. Un boton para silenciar y una perilla de volumen por stem.
+// Al tocar cualquiera, se empieza a separar el audio.
 class StemPanel : public juce::Component, private juce::Timer
 {
 public:
@@ -276,7 +291,11 @@ public:
     void paint (juce::Graphics& g) override;
     void resized() override;
 
-    std::function<void()> onRemove;
+    // Estado para dibujar la barrita de avance y el boton "Orig"
+    void setState (bool isBusy, float progressValue, bool stemsReady);
+
+    std::function<void()> onTouch;    // el usuario toco un stem
+    std::function<void()> onRemove;   // volver al audio original
 
 private:
     struct Knob
@@ -293,7 +312,10 @@ private:
     int paramIndex[4] = { 3, 0, 1, 2 };
     std::array<Knob, 4> knobs;
     std::array<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>, 4> atts;
-    juce::TextButton removeButton { "Sin stems" };
+    juce::TextButton removeButton { "Orig" };
+    bool busy = false;
+    bool hasStemsNow = false;
+    float progress = 0.0f;
 };
 
 // Contenedor de toda la interfaz: se dibuja a 960x720 y se escala entero (100%, 85%, 75%)
@@ -361,6 +383,7 @@ private:
     void stepDivision (int delta);
     void shiftSlicer (int dir);
     void applyScale (float s);
+    void requestStems();
 
     TongaLook look;
     TongaProcessor& proc;
@@ -387,7 +410,6 @@ private:
     juce::Slider bpmBox, keyBox, detuneBox;
     juce::Label keyLabel, detuneLabel;
     juce::TextButton syncButton { "SYNC" };
-    juce::TextButton stemsButton { "Separar stems" };
     StemPanel stemPanel { proc.apvts };
 
     // Perillas y cajas del pad seleccionado
@@ -413,9 +435,8 @@ private:
     int lastCounter = 0;
     bool updatingControls = false;
     bool needReslice = false;
-    bool stemPanelOpen = false;
-    bool hadStems = false;
     bool wasBusy = false;
+    bool warnedNoStems = false;
 
     std::unique_ptr<juce::FileChooser> chooser;
 

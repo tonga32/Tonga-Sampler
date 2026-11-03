@@ -1158,6 +1158,7 @@ void TongaProcessor::startStemSeparation()
 
     stemCancel.store (false);
     stemProgress.store (0.0f);
+    stemStartMs.store (juce::Time::getMillisecondCounterHiRes());
     stemBusy.store (true);
     setStemMessage ("Separando...");
 
